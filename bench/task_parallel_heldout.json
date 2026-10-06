@@ -1,0 +1,23 @@
+[
+ {"id": "h-caching", "category": "comparative analysis", "decomposable": true,
+  "prompt": "Compare three caching layers for a high-traffic web application - a CDN, an in-process/application cache (e.g. Redis or memcached in front of the database) and the database's own query/buffer cache. For each: what it is good for, invalidation strategy, consistency risks, failure modes, and cost. Then recommend how to combine them for a news site with 50 million page views per day and frequent breaking-news updates.",
+  "check": {"type": "rubric", "rubric": ["CDN: static and cacheable pages, TTL/purge, edge", "app cache: hot objects, cache-aside, stampede protection", "DB cache: buffer pool, automatic but limited", "invalidation strategies and staleness for breaking news (short TTL / purge API / surrogate keys)", "failure modes (stampede, cold cache, stale data)", "combined recommendation"]}},
+ {"id": "h-palindrome", "category": "simple coding", "decomposable": false,
+  "prompt": "Write a Python function that checks whether a string is a palindrome, ignoring punctuation, spaces and case.",
+  "check": {"type": "python", "func": "is_palindrome", "tests": [["'A man, a plan, a canal: Panama'", "True"], ["'hello'", "False"], ["''", "True"]]}},
+ {"id": "h-startup", "category": "numerical/financial analysis", "decomposable": true,
+  "prompt": "Our SaaS startup has $2.0M ARR growing 8% month over month, an 85% gross margin, a net burn of $300k per month and $3.0M in the bank. Analyze: (1) the runway if burn stays flat and if burn grows 5% per month, (2) ARR after 12 months at the current growth rate and if growth decays to 4% month over month, (3) the main unit-economics risks we should check, and (4) when we should start fundraising. Show the key calculations.",
+  "check": {"type": "rubric", "rubric": ["runway flat burn = 10 months", "runway with 5%/month burn growth ~ 8 months (sum 300k*1.05^k reaches 3M after ~8.1 months)", "ARR after 12 months at 8% ~ $5.04M", "decay scenario computed and lower", "unit economics risks: CAC payback, churn/NRR, LTV/CAC, margin", "fundraising timing ~ start 6-9 months before cash-out, i.e. now/very soon"]}},
+ {"id": "h-romeo", "category": "short summary", "decomposable": false,
+  "prompt": "Summarize the plot of Romeo and Juliet in three sentences.", "check": {"type": "rubric", "rubric": ["three-sentence summary"]}},
+ {"id": "h-api-security", "category": "security review", "decomposable": true,
+  "prompt": "Evaluate the security of a public REST API with these properties: API keys are passed in the URL query string, there is no rate limiting, error responses include stack traces and SQL fragments, CORS allows any origin with credentials, and the /admin endpoints are protected only by an X-Admin: true header. Explain the risk of each issue, how it could be exploited, and give a prioritized remediation plan.",
+  "check": {"type": "rubric", "rubric": ["keys in query strings leak via logs/referrers/history; move to Authorization header + rotation", "no rate limiting: brute force / abuse / DoS; add per-key limits", "verbose errors leak internals aiding SQLi; generic errors + logging", "CORS * with credentials (browsers block wildcard+credentials but reflected origins are dangerous); allowlist", "X-Admin header trivially spoofable: critical; real authZ", "prioritized plan with admin auth first"]}},
+ {"id": "h-tcp-udp", "category": "simple explanation", "decomposable": false,
+  "prompt": "Explain the difference between TCP and UDP.", "check": {"type": "rubric", "rubric": ["connection-oriented reliable ordered vs connectionless best-effort"]}},
+ {"id": "h-onboarding", "category": "planning", "decomposable": true,
+  "prompt": "Design a two-week onboarding program for a new senior backend engineer joining a 30-person product team that runs a Python/PostgreSQL platform on Kubernetes. Cover technical ramp-up, product and domain knowledge, team and process integration, a first meaningful contribution, and how to measure that onboarding worked.",
+  "check": {"type": "rubric", "rubric": ["day-by-day or week structure", "technical setup and architecture walkthrough", "product/domain sessions", "buddy/mentor and team rituals", "first contribution scoped (e.g. small feature/bugfix to production)", "success measures (time to first PR, feedback, checklist)"]}},
+ {"id": "h-prime", "category": "simple math", "decomposable": false,
+  "prompt": "Is 1009 a prime number? Explain briefly.", "check": {"type": "contains", "any": ["prime"]}}
+]
