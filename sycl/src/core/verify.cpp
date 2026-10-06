@@ -2,6 +2,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/core/verify.hpp"
+#include "strata/env_flag.hpp"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -1359,7 +1360,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     // memory are not reliably visible while the graph runs (measured: the ring is seen late or not at all),
     // so waiting on them per layer fails. STRATA_VERIFY_NO_HOST=1 waits for the whole window instead. Only for
     // an all-resident cache: a missed expert would leave the GPU waiting for a plan that never comes.
-    static const bool no_host = std::getenv("STRATA_VERIFY_NO_HOST") != nullptr;
+    static const bool no_host = strata::env_flag("STRATA_VERIFY_NO_HOST");   // Strata Void: =0 is off, not on
     const int64_t steps = (le_ - lb_) * G;
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     for (int64_t k = 0; !no_host && k < steps; ++k) {

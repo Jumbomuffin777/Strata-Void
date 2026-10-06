@@ -25,6 +25,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/env_flag.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
@@ -3829,10 +3830,14 @@ int main(int argc, char **argv) try {
         }
         unmirrored_misses = (int64_t) miss.size() - (int64_t) (gguf_src.mirrored_bytes() ? std::count_if(miss.begin(), miss.end(),
             [&](const std::pair<int64_t, int64_t>& pr) { return gguf_src.pinned(pr.first, pr.second); }) : 0);
-        if (unmirrored_misses > 0 && std::getenv("STRATA_VERIFY_NO_HOST") != nullptr)
-            std::fprintf(stderr, "strata generate: WARNING: %lld experts are neither in VRAM nor mirrored; with STRATA_VERIFY_NO_HOST "
-                                 "the device plan cannot run them and their layers' windows fall back slowly - raise "
-                                 "STRATA_MIRROR_MIB or the free RAM, or lower --max-context\n", (long long) unmirrored_misses);
+        if (unmirrored_misses > 0 && strata::env_flag("STRATA_VERIFY_NO_HOST")) {
+            // Strata Void: refuse instead of warning. With STRATA_VERIFY_NO_HOST the host never answers a window's
+            // per-layer flags, so a routed expert that is neither in VRAM nor mirrored has no plan at all.
+            std::fprintf(stderr, "strata generate: %lld experts are neither in VRAM nor mirrored and STRATA_VERIFY_NO_HOST "
+                                 "is on: refusing to start (unset it, or make every expert resident or mirrored)\n",
+                         (long long) unmirrored_misses);
+            return 1;
+        }
     }
 
     for (auto& stp : stages) {
