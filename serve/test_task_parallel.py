@@ -196,6 +196,14 @@ class Orchestration(unittest.TestCase):
         self.assertEqual(out.kind, "direct")
         self.assertEqual([c.role for c in b.calls], ["planner"])
 
+    def test_auto_low_effort_stays_at_one(self):
+        for effort, kind in (("low", "direct"), ("medium", "direct"), ("high", "synthesize"), ("", "synthesize")):
+            b = FakeBackend(plan_json(2, effort=effort) if effort else plan_json(2))
+            out = self.run_orch(b, "auto")
+            self.assertEqual(out.kind, kind, effort)
+            b = FakeBackend(plan_json(2, effort=effort) if effort else plan_json(2))
+            self.assertEqual(self.run_orch(b, 2).kind, "synthesize")      # a fixed count ignores the estimate
+
     def test_workers_run_concurrently_then_synthesis(self):
         b = FakeBackend(plan_json(4), delay=0.3)
         t = time.time()

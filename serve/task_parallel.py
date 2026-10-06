@@ -49,6 +49,7 @@ class Config:
     total_timeout_s: float = 600.0       # planner + every worker attempt
     retries: int = 1                     # a failed worker (error / empty output) is tried again once
     gate_threshold: int = 2              # AUTO: the heuristic score a request needs before the planner is asked
+    auto_skip_effort: str = "low,medium"  # AUTO answers normally when the planner rates the request this effort
     internal_effort: str = "low"         # the reasoning effort every internal request is rendered with ("": the
     #                                      template's default) - one setting for all, so their shared prefix matches
 
@@ -163,6 +164,7 @@ class Plan:
     strategy: str = "partition"
     reason: str = ""
     subtasks: list = field(default_factory=list)
+    effort: str = ""                     # the planner's estimate of the work a careful single answer needs
 
 
 class PlanError(ValueError):
@@ -202,10 +204,12 @@ def parse_plan(text: str, cfg: Config, max_workers: int, exact: int | None = Non
         p = int(p)
     if not isinstance(p, int) or isinstance(p, bool) or p < 1:
         raise PlanError("parallelism must be a positive whole number")
+    effort = str(obj.get("effort") or "").strip().lower()
+    effort = effort if effort in ("low", "medium", "high") else ""
     if p == 1:
         if exact:
             raise PlanError(f"the planner chose 1 subtask where {exact} were asked for")
-        return Plan(1, reason=str(obj.get("reason") or "")[:300])
+        return Plan(1, reason=str(obj.get("reason") or "")[:300], effort=effort)
     if p > max_workers:
         raise PlanError(f"parallelism {p} exceeds the limit {max_workers}")
     if exact and p != exact:
@@ -247,7 +251,7 @@ def parse_plan(text: str, cfg: Config, max_workers: int, exact: int | None = Non
             raise PlanError("not enough context left for the subtasks and the synthesis")
         for s in subtasks:
             s.max_tokens = max(cfg.min_tokens, int(s.max_tokens * room / total))
-    return Plan(p, strategy, str(obj.get("reason") or "")[:300], subtasks)
+    return Plan(p, strategy, str(obj.get("reason") or "")[:300], subtasks, effort)
 
 
 # ------------------------------------------------------------------------------------------------ AUTO's gate
@@ -348,8 +352,11 @@ def planner_prompt(cfg: Config, max_workers: int, exact: int | None) -> str:
         f"STEP plan. Rules: {n_rule} strategy \"partition\": distinct parts (items, components, dimensions, "
         "questions), one per subtask, together covering everything without overlap; \"independent\": one hard "
         "problem, each subtask solves or checks the WHOLE of it from a different angle (solution, alternative, "
-        "review, edge cases). Each subtask is one short sentence saying exactly what to produce. Reply with only "
-        'this JSON: {"parallelism": <n>, "strategy": "partition"|"independent", "subtasks": ["...", "..."]}')
+        "review, edge cases). Each subtask is one short sentence saying exactly what to produce. effort: how much "
+        "work one careful answer to the whole request needs - \"low\" (routine, a few minutes for an expert), "
+        "\"medium\", \"high\" (extended analysis, design, debugging or calculation across several parts). Reply "
+        'with only this JSON: {"effort": "low"|"medium"|"high", "parallelism": <n>, "strategy": '
+        '"partition"|"independent", "subtasks": ["...", "..."]}')
 
 
 def _short(text: str, words: int = 12) -> str:
@@ -442,8 +449,14 @@ class Orchestrator:
             return Outcome("direct", meta=meta)
         meta["strategy"] = plan.strategy if plan.parallelism > 1 else None
         meta["reason"] = plan.reason
+        meta["effort"] = plan.effort or None
         if plan.parallelism == 1:
             meta.update(decision="1: the planner found no independent parts")
+            return Outcome("direct", meta=meta)
+        if mode.kind == "auto" and plan.effort in cfg.auto_skip_effort.split(","):
+            # measured break-even: the plan, the admissions and the synthesis cost more than a request whose single
+            # answer needs little work saves by running its parts side by side
+            meta.update(decision=f"1: {plan.effort}-effort request (parallel work would not pay)")
             return Outcome("direct", meta=meta)
         # ---- the subtasks, at the same time
         self.progress(f"running {plan.parallelism} subtasks")
