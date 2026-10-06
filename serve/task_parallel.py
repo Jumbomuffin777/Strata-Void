@@ -49,7 +49,7 @@ class Config:
     total_timeout_s: float = 600.0       # planner + every worker attempt
     retries: int = 1                     # a failed worker (error / empty output) is tried again once
     gate_threshold: int = 2              # AUTO: the heuristic score a request needs before the planner is asked
-    auto_skip_effort: str = "low,medium"  # AUTO answers normally when the planner rates the request this effort
+    auto_skip_effort: str = "low"  # AUTO answers normally when the planner rates the request this effort
     internal_effort: str = "low"         # the reasoning effort every internal request is rendered with ("": the
     #                                      template's default) - one setting for all, so their shared prefix matches
 
@@ -277,8 +277,16 @@ def gate_score(text: str) -> tuple[int, list[str]]:
     elif n >= 600:
         score += 1; why.append("medium length")
     items = len(re.findall(r"(?m)^\s*(?:[-*•]|\d+[.)]|[a-z][.)])\s+\S", t))
+    items = max(items, len(re.findall(r"(?:^|\s)\(\d+\)\s", t)))             # inline (1) ... (2) ... (3)
     if items >= 3:
         score += 2; why.append(f"{items} listed items")
+    else:
+        # an enumeration inside one sentence ("cover A, B, C, and D"): the most comma/semicolon-separated parts
+        # in a sentence, parenthesized asides not counted
+        flat = re.sub(r"\([^()]*\)", "", t)
+        parts = max((len(re.findall(r"[,;]", x)) + 1 for x in re.split(r"[.!?](?:\s|$)|\n", flat)), default=0)
+        if parts >= 4:
+            score += 2; why.append(f"{parts} enumerated parts")
     q = t.count("?")
     if q >= 3:
         score += 1; why.append(f"{q} questions")

@@ -112,6 +112,18 @@ class Gate(unittest.TestCase):
         code = "Find and fix all the bugs in this function, explain each one:\n```python\n" + "x = 1\n" * 40 + "```"
         self.assertGreaterEqual(tp.gate_score(code)[0], tp.Config().gate_threshold)
 
+    def test_enumerations_count(self):
+        # parts named inside one sentence, or numbered inline, are independent dimensions; asides in parentheses
+        # do not count as parts
+        inline = ("Explain the causes of the crisis, organized around: housing and lending, financial innovation "
+                  "(securitization, CDOs, swaps), leverage and regulation, and global imbalances.")
+        self.assertTrue(any("enumerated parts" in w for w in tp.gate_score(inline)[1]))
+        self.assertGreaterEqual(tp.gate_score(inline)[0], tp.Config().gate_threshold)
+        numbered = "Work out (1) the runway, (2) the revenue in a year and (3) the risks, for our startup's numbers."
+        self.assertIn("3 listed items", tp.gate_score(numbered)[1])
+        aside = "Summarize this paragraph about apples (red, green, yellow, and pink ones) in one line please, ok."
+        self.assertFalse(any("enumerated" in w for w in tp.gate_score(aside)[1]))
+
 
 class Plans(unittest.TestCase):
     cfg = tp.Config()
@@ -197,7 +209,7 @@ class Orchestration(unittest.TestCase):
         self.assertEqual([c.role for c in b.calls], ["planner"])
 
     def test_auto_low_effort_stays_at_one(self):
-        for effort, kind in (("low", "direct"), ("medium", "direct"), ("high", "synthesize"), ("", "synthesize")):
+        for effort, kind in (("low", "direct"), ("medium", "synthesize"), ("high", "synthesize"), ("", "synthesize")):
             b = FakeBackend(plan_json(2, effort=effort) if effort else plan_json(2))
             out = self.run_orch(b, "auto")
             self.assertEqual(out.kind, kind, effort)
