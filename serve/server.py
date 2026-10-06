@@ -59,6 +59,7 @@ from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
+from serve import task_parallel  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -696,6 +697,11 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
+        # task-parallel requests (serve/task_parallel.py): the shared prefix's length, a checkpoint hint for an engine
+        # that says INFO prefix_ckpt=1 (the caller only sets it then)
+        ck = sampling.get("_prefix_ckpt")
+        if isinstance(ck, int) and not isinstance(ck, bool) and ck > 0:
+            keys += f" ckpt={ck}"
         return keys + StrataEngine.projection_key(sampling)
 
     @staticmethod
@@ -1711,6 +1717,10 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        # task-parallel requests (serve/task_parallel.py, opt-in): the server-wide default mode (None: off unless a
+        # request asks) and its limits (the config's "task_parallel" object)
+        self.task_parallel_default = None
+        self.task_parallel_cfg = task_parallel.Config()
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
 
@@ -2146,6 +2156,56 @@ class Service:
             return self.tok.encode(prompt, parse_special=True)
         prompt, plain = unmark_think_literals(prompt)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
+
+    def render_internal(self, messages, thinking: str = "on", effort: str = "") -> list[int]:
+        """The prompt of an internal request (task-parallel planner / subtask / synthesis): the conversation rendered
+        with the same template settings for every internal request - `effort` (the template's reasoning effort, "":
+        its default) whatever the request's thinking - so their shared first messages render and tokenize the same,
+        then the generation prompt for `thinking` ("on", or "off": the template's no-thinking header).  A template this
+        cannot take apart is rendered as an ordinary request instead."""
+        marked, _, changed = mark_think_literals(messages, None)
+        kw = {"reasoning_effort": effort} if effort else {}
+        history = self.template.render(marked, add_generation_prompt=False, **kw)
+        full = self.template.render(marked, **kw)
+        if thinking == "off":
+            off_full = self.template.render(marked, enable_thinking=False)
+            off_mine = self.template.render(marked, add_generation_prompt=False, enable_thinking=False)
+            gen = off_full[len(off_mine):] if off_full.startswith(off_mine) else None
+        else:
+            gen = full[len(history):] if full.startswith(history) else None
+        if gen is None:
+            prompt = self.template.render(marked, **({"enable_thinking": False} if thinking == "off" else kw))
+        else:
+            prompt = history + gen
+        if not changed:
+            return self.tok.encode(prompt, parse_special=True)
+        prompt, plain = unmark_think_literals(prompt)
+        return self.tok.encode(prompt, parse_special=True, plain=plain)
+
+    def internal_prefix_len(self, prefix_messages, ids, effort: str = "") -> int:
+        """How many of `ids` are the shared `prefix_messages` (task-parallel requests' common context): the text the
+        template renders for them before the next turn begins, when `ids` starts with exactly its tokens; 0 when it
+        cannot tell.  Two renders with different next turns are compared (a template may refuse a conversation without
+        a user message), and the common text is cut where its last turn starts, so the cut is a special token."""
+        if not prefix_messages:
+            return 0
+        marked, _, changed = mark_think_literals(prefix_messages, None)
+        if changed:
+            return 0
+        try:
+            kw = {"reasoning_effort": effort} if effort else {}
+            a = self.template.render(marked + [{"role": "user", "content": "\x01a"}], add_generation_prompt=False, **kw)
+            b = self.template.render(marked + [{"role": "user", "content": "\x02b"}], add_generation_prompt=False, **kw)
+        except Exception:
+            return 0
+        n = 0
+        while n < min(len(a), len(b)) and a[n] == b[n]:
+            n += 1
+        cut = a[:n].rfind("<|im_start|>")
+        if cut <= 0:
+            return 0
+        pre = self.tok.encode(a[:cut], parse_special=True)
+        return len(pre) if 0 < len(pre) < len(ids) and list(ids[:len(pre)]) == list(pre) else 0
 
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
@@ -2658,6 +2718,58 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
             yield last
+
+
+class ServiceBackend:
+    """serve/task_parallel.py's Backend on this server: an internal request is an ordinary Service.run - the engine's
+    batch slots (--batch) run several at once - with the prompt from render_internal, the request's own sampling
+    (the planner is greedy), and, when the engine says INFO prefix_ckpt=1, the shared prefix's checkpoint hint."""
+
+    _SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty", "frequency_penalty",
+                 "presence_penalty", "penalty_last_n")
+
+    def __init__(self, svc: "Service", req: dict, effort: str = ""):
+        self.svc, self.effort = svc, effort
+        self.sampling = {k: req[k] for k in self._SAMPLING if req.get(k) is not None}
+
+    def concurrency(self) -> int:
+        return max(1, int(getattr(self.svc.engine, "batch", 0) or 0))
+
+    def context(self) -> int:
+        return int(self.svc.engine.max_context or getattr(self.svc.engine, "known_ctx", 0) or 0)
+
+    def count_tokens(self, call) -> int:
+        return len(self.svc.render_internal(call.messages, call.thinking, self.effort))
+
+    def generate(self, call, cancel: threading.Event):
+        r = task_parallel.Result(t_start=time.time())
+        ids = self.svc.render_internal(call.messages, call.thinking, self.effort)
+        room = self.context() - CTX_SLACK - len(ids)
+        if room < 16:
+            raise ValueError(f"the {call.role}'s prompt ({len(ids)} tokens) leaves no room in the context")
+        max_new = min(call.max_tokens, room) if call.max_tokens > 0 else room
+        sampling = {} if call.role == "planner" else dict(self.sampling)
+        sampling["reasoning_budget_tokens"] = int(call.reasoning_budget or 0)
+        if (getattr(self.svc.engine, "info", {}) or {}).get("prefix_ckpt"):
+            n = self.svc.internal_prefix_len(call.shared_prefix, ids, self.effort)
+            if n:
+                sampling["_prefix_ckpt"] = n
+        r.prompt_tokens = len(ids)
+        text = []
+        for kind, x in self.svc.run(ids, call.thinking != "off", None, max_new, sampling, cancel):
+            if kind == "event":
+                if r.t_first is None and x.text:
+                    r.t_first = time.time()
+                if x.kind == "content":
+                    text.append(x.text)
+            elif kind == "done":
+                r.finish = x.get("finish", "")
+                r.completion_tokens = x.get("completion_tokens", 0)
+                r.reasoning_tokens = x.get("reasoning_tokens", 0)
+                r.reused_tokens = x.get("reused", 0) or 0
+        r.text = "".join(text)
+        r.t_end = time.time()
+        return r
 
 
 def _is_json(text: str) -> bool:
@@ -3381,6 +3493,13 @@ def make_handler(svc: Service):
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
+            # task-parallel requests (opt-in: the request's "task_parallel", else the config's default): their own path
+            tp_value = req.get("task_parallel", svc.task_parallel_default)
+            if tp_value is not None:
+                tp_mode = task_parallel.parse_mode(tp_value)  # a bad value is a 400
+                # not with tools/MCP, a structured response_format or images (v1): such a request runs as usual
+                if not tp_mode.off and not tools and validator is None and not images_of(messages):
+                    return self._openai_task_parallel(req, messages, kw, tp_mode, max_req)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
@@ -3416,6 +3535,115 @@ def make_handler(svc: Service):
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+
+        def _openai_task_parallel(self, req, messages, kw, mode, max_req):
+            """A task-parallel chat completion (serve/task_parallel.py): plan, the subtasks at once in the engine's
+            batch slots, then the synthesis as this request's answer - streamed like any answer.  Only the final
+            answer reaches the client; the subtasks' text stays inside.  The response carries a `task_parallel` object
+            (timings, counts; the subtasks' objectives with "task_parallel_diagnostics": true).  Any failure of the
+            orchestration falls back to answering the request as usual."""
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            stream = bool(req.get("stream"))
+            diagnostics = req.get("task_parallel_diagnostics") is True
+            client_thinks = kw.get("enable_thinking", True) is not False
+            effort = svc.task_parallel_cfg.internal_effort
+            backend = ServiceBackend(svc, req, effort)
+            orch = task_parallel.Orchestrator(backend, svc.task_parallel_cfg)
+            events: "queue.Queue" = queue.Queue()
+            orch.progress = lambda stage: events.put(("progress", stage))
+            if stream:
+                self._sse()
+            outcome = None
+            def work():
+                try:
+                    events.put(("outcome", orch.run(messages, mode, cancel,
+                                                    "on" if client_thinks else "off")))
+                except Exception as e:          # the orchestration's own bug: answer as usual, say why
+                    events.put(("outcome", task_parallel.Outcome("direct", meta={
+                        "mode": "auto" if mode.kind == "auto" else str(mode.workers), "enabled": False,
+                        "workers": 1, "fallback": f"orchestration error: {type(e).__name__}: {e}"})))
+            threading.Thread(target=work, daemon=True, name="strata-task-parallel").start()
+            try:
+                while outcome is None:
+                    try:
+                        kind, x = events.get(timeout=5.0)
+                    except queue.Empty:
+                        kind, x = "ping", None
+                    if kind == "outcome":
+                        outcome = x
+                    elif stream:                # SSE comments: clients ignore them; they keep connections alive
+                        line = f": task_parallel {x}" if kind == "progress" else ": keep-alive"
+                        self.wfile.write(line.encode() + b"\n\n")
+                        self.wfile.flush()
+            except OSError:
+                self._note(outcome="disconnected")
+                cancel.set()
+                return
+            meta = outcome.meta
+            if cancel.is_set():
+                self._note(outcome="disconnected")
+                return
+            t_synth = time.time()
+            if outcome.kind == "synthesize":
+                synth = outcome.synthesis
+                ids = svc.render_internal(synth.messages, synth.thinking, effort)
+                thinking = synth.thinking != "off"
+                room = backend.context() - CTX_SLACK - len(ids)
+                if room < 1:
+                    raise ValueError(f"the synthesis prompt ({len(ids)} tokens) leaves no room to answer")
+                max_new = min(max_req, room) if max_req and max_req > 0 else room
+                sampling = dict(req)
+                if req.get("reasoning_budget_tokens") is None and synth.reasoning_budget:
+                    sampling["reasoning_budget_tokens"] = synth.reasoning_budget
+                if (getattr(svc.engine, "info", {}) or {}).get("prefix_ckpt"):
+                    n = svc.internal_prefix_len(synth.shared_prefix, ids, effort)
+                    if n:
+                        sampling["_prefix_ckpt"] = n
+            else:
+                ids, thinking, max_new = svc.prepare(messages, None, kw, max_req)
+                sampling = req
+            done = {}
+
+            def recorded(gen):
+                for item in gen:
+                    if item[0] == "done":
+                        done.update(item[1])
+                    yield item
+            chunks = openai_chunks(svc, req, ids, thinking, None, max_new, cancel,
+                                   run=recorded(svc.run(ids, thinking, None, max_new, sampling, cancel)))
+            chunks = self._capture(chunks, "openai")
+
+            def final_meta():
+                return task_parallel.finish_meta(meta, t_synth, done.get("completion_tokens", 0),
+                                                 done.get("reasoning_tokens", 0), diagnostics=diagnostics)
+            if not stream:
+                body = openai_collect(chunks)
+                body["task_parallel"] = final_meta()
+                return self._json(200, body)
+            try:
+                for c in chunks:
+                    if c is None:
+                        self.wfile.write(b": keep-alive\n\n")
+                    else:
+                        self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.flush()
+                last = {"id": "chatcmpl-tp", "object": "chat.completion.chunk", "created": int(time.time()),
+                        "model": svc.model_for(req), "choices": [], "task_parallel": final_meta()}
+                self.wfile.write(b"data: " + json.dumps(last, ensure_ascii=False).encode() + b"\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+            except OSError:
+                self._note(outcome="disconnected")
+                cancel.set()
+                chunks.close()
+            except EngineDied as e:
+                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except ValueError as e:
+                err = {"error": {"type": "server_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
@@ -4074,6 +4302,20 @@ def main() -> int:
         if budget:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
+    tp_cfg = cfg.get("task_parallel")                  # serve/task_parallel.py (opt-in)
+    if tp_cfg is not None:
+        try:
+            if isinstance(tp_cfg, dict):
+                svc.task_parallel_cfg = task_parallel.Config.from_dict(tp_cfg)
+                default = tp_cfg.get("default")
+            else:
+                default = tp_cfg                        # "task_parallel": "auto" - just the default mode
+            if default is not None and not task_parallel.parse_mode(default).off:
+                svc.task_parallel_default = default
+                print(f"[strata] task-parallel requests: {default} by default (a request's task_parallel wins)",
+                      flush=True)
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
