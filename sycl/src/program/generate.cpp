@@ -3788,11 +3788,16 @@ int main(int argc, char **argv) try {
     // the GPU takes is --pcie-frac; STRATA_MIRROR_MIB caps the mirror (default: MemAvailable less 4 GiB), 0 = off.
     unsigned long long* mirror_table_d = nullptr;   // [n_layers][n_expert] device-readable mirror addresses (0 = none)
     int64_t unmirrored_misses = 0;
+    // Strata Void: with a layer split CUDA0 runs only layers [0, its end): the later stages' experts live in their own
+    // caches. Counting them here mirrored (or, with STRATA_VERIFY_NO_HOST, refused) experts CUDA0 never runs.
+    int64_t cuda0_le = g.n_layers;
+    for (const auto& stp : stages) cuda0_le = std::min<int64_t>(cuda0_le, stp->lb);
     if (o.stream_experts && srcp == &gguf_src && o.expert_cache > 0) {
         std::vector<std::pair<int64_t, int64_t>> miss;
         for (const auto& pr : profile)   // the profile's order: the most-routed misses first, if the cap is reached
-            if (xcache.slot_of(pr.first, pr.second) == strata::core::kNotResident) miss.push_back({pr.first, pr.second});
-        for (int64_t l = 0; l < g.n_layers; ++l)                     // pairs the profile does not list at all
+            if (pr.first < cuda0_le && xcache.slot_of(pr.first, pr.second) == strata::core::kNotResident)
+                miss.push_back({pr.first, pr.second});
+        for (int64_t l = 0; l < cuda0_le; ++l)                       // pairs the profile does not list at all
             for (int64_t e = 0; e < g.n_expert; ++e)
                 if (xcache.slot_of(l, e) == strata::core::kNotResident &&
                     std::find(miss.begin(), miss.end(), std::pair<int64_t, int64_t>{l, e}) == miss.end())
@@ -3805,7 +3810,16 @@ int main(int argc, char **argv) try {
             std::fclose(f);
         }
         const char* mv = std::getenv("STRATA_MIRROR_MIB");
-        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        if (!stages.empty() && cap > 0) {
+            // Strata Void: the device plan finds a layer's mirror slice from its pointer into CUDA0's residency table
+            // (resident_plan_set_mirror); a later stage's table is another allocation on another card, so with a
+            // layer split the mirror would hand the stages addresses that are not theirs. No mirror with a split.
+            if (!miss.empty())
+                std::fprintf(stderr, "strata generate: layer split: no pinned host mirror for CUDA0's %zu missing experts "
+                                     "(the mirror is single-GPU in this port)\n", miss.size());
+            cap = 0;
+        }
         if (!miss.empty() && cap > 0) {
             const auto tm = Clock::now();
             const int64_t got = gguf_src.mirror(miss, cap, 8, err);
@@ -3900,6 +3914,28 @@ int main(int argc, char **argv) try {
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
+    if (!stages.empty() && o.stream_experts) {
+        // Strata Void: every stage's residency, from its own cache. CUDA0's misses were counted above (its layers only).
+        int64_t stage_misses = 0;
+        for (const auto& stp : stages) {
+            int64_t held = 0, miss_here = 0;
+            for (int64_t l = stp->lb; l < stp->le; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    (stp->cache.slot_of(l, e) >= 0 ? held : miss_here) += 1;
+            std::fprintf(stderr, "strata generate: layer split: CUDA%d holds %lld of the %lld experts of layers %lld-%lld\n",
+                         stp->dev, (long long) held, (long long) (held + miss_here), (long long) stp->lb,
+                         (long long) (stp->le - 1));
+            stage_misses += miss_here;
+        }
+        std::fprintf(stderr, "strata generate: layer split: CUDA0 holds %lld of the %lld experts of layers 0-%lld\n",
+                     (long long) (cuda0_le * g.n_expert - unmirrored_misses), (long long) (cuda0_le * g.n_expert),
+                     (long long) (cuda0_le - 1));
+        if (stage_misses > 0 && strata::env_flag("STRATA_VERIFY_NO_HOST")) {
+            std::fprintf(stderr, "strata generate: %lld experts of the later stages are not in their VRAM and "
+                                 "STRATA_VERIFY_NO_HOST is on: refusing to start\n", (long long) stage_misses);
+            return 1;
+        }
+    }
 
     std::array<strata::core::RemoteExperts, 3> remote_experts;
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
