@@ -3,6 +3,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/core/verify.hpp"
 #include "strata/env_flag.hpp"
+#include "strata/split_trace.hpp"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -1292,6 +1293,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     SessionState& ss = *ss_;
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    strata::split_trace("run_enter", lb_, T, pos0);
+    if (pending_commit_ != 0 && !commit_finish(err)) return false;   // a commit left running lands first (PLE history)
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
@@ -1344,6 +1347,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     DPCT1000: Error handling if-stmt was detected but could not be rewritten.
     */
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+    strata::split_trace("run_launched", lb_, T, pos0);
     if (le != 0) {
         err =
             std::string("verify: launch: ") + dpct::get_error_string_dummy(le);
@@ -1450,6 +1454,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("SYNC", -1, -1, 0);
     const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
     trace_ev("SYNCED", -1, -1, (int64_t) se);
+    strata::split_trace("run_synced", lb_, T, pos0);
     if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {
         const Clock::time_point t_done = Clock::now();
         std::fprintf(stderr, "verify dbg: T=%d window: since previous window %.1f ms, staging %.1f ms, gpu %.1f ms\n", T,
@@ -1534,6 +1539,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     copy_->wait(); // no host function of this window may raise flag B in the
                    // next one
+    strata::split_trace("run_copied", lb_, T, pos0);
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
         if (std::getenv("STRATA_VERIFY_EAGER") == nullptr)   // eager: prof_h_ already holds the host clocks
             dpct::get_in_order_queue()
@@ -1770,15 +1776,20 @@ bool Verifier::commit(int n_keep, std::string &err, bool wait) try {
     /*
     DPCT1000: Error handling if-stmt was detected but could not be rewritten.
     */
+    strata::split_trace("commit_launched", lb_, n_keep, 0);
     if (le != 0) {
         err = std::string("verify: commit launch: ") +
               dpct::get_error_string_dummy(le);
         return false;
     }
-    if (!wait && next_ == nullptr) {   // left running: commit_finish() collects it (the drafter overlaps it)
+    // Strata Void (STRATA_SPLIT_ASYNC_COMMIT=1): with a layer split every stage's commit is left running, not only the
+    // last's: each stage commits its own layers' state on its own in-order queue, so the next window's graph there
+    // runs after it without a host wait, and the three cards commit at once while the drafter runs.
+    static const bool async_all = strata::env_flag("STRATA_SPLIT_ASYNC_COMMIT");
+    if (!wait && (next_ == nullptr || async_all)) {   // left running: commit_finish() collects it (the drafter overlaps it)
         pending_commit_ = n_keep;
         pending_commit_t0_ = t0;
-        return true;
+        return next_ == nullptr || next_->commit(n_keep, err, false);
     }
     pending_commit_ = n_keep;
     pending_commit_t0_ = t0;
@@ -1803,6 +1814,7 @@ bool Verifier::commit_finish(std::string &err) try {
     const int n_keep = pending_commit_;
     pending_commit_ = 0;
     const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
+    strata::split_trace("commit_synced", lb_, n_keep, 0);
     if (se != 0) {
         err = std::string("verify: commit: ") + dpct::get_error_string_dummy(se);
         return false;
