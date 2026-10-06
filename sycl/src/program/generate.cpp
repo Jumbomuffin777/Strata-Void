@@ -6183,7 +6183,8 @@ int main(int argc, char **argv) try {
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         // --batch (SYCL port of #465 at 9461f5e): slots do not keep their conversations (slot_cache=0)
-                        o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) + " slot_cache=0").c_str() : "");
+                        (std::string(" prefix_ckpt=1") +
+                         (o.batch > 0 ? " batch_slots=" + std::to_string(o.batch) + " slot_cache=0" : "")).c_str());
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -6628,6 +6629,10 @@ int main(int argc, char **argv) try {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            // ckpt=N (INFO prefix_ckpt=1): the prompt's first N tokens are a prefix other requests will share (a
+            // task-parallel request's common context): the read stops there once and checkpoints it, so the next
+            // request with the same N tokens mounts it instead of reading them again.  Absent: unchanged.
+            int64_t req_ckpt = -1;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -6653,6 +6658,7 @@ int main(int argc, char **argv) try {
                     else if (key == "logprobs") req_logprobs = std::clamp(std::atoi(tok.c_str() + eq + 1), -1, 20);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "ckpt") req_ckpt = std::atoll(tok.c_str() + eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -7190,8 +7196,13 @@ int main(int argc, char **argv) try {
                         if (i >= o.prompt_cache_root) root_at = i;
                         break;
                     }
+            // the request's shared-prefix hint (ckpt=N), when it lies inside what is still to read
+            const int64_t hint_at = (o.prompt_cache > 0 && req_ckpt > read_from && req_ckpt < n - 1) ? req_ckpt : -1;
+            std::vector<int64_t> bounds = {reread_to, root_at, hint_at, turn_at, n - 1};
+            std::sort(bounds.begin(), bounds.end());
+            bounds.erase(std::unique(bounds.begin(), bounds.end()), bounds.end());
             int64_t at = read_from;
-            for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
+            for (const int64_t to : bounds) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
@@ -7234,7 +7245,7 @@ int main(int argc, char **argv) try {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
+                if ((to == turn_at || to == root_at || to == hint_at) && !checkpoint_at(to)) {
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }
