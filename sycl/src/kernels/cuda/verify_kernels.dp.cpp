@@ -926,12 +926,20 @@ inline bool plan_parallel() {   // STRATA_PLAN_PARALLEL=0: thread 0 groups the e
     static const bool v = std::getenv("STRATA_PLAN_PARALLEL") == nullptr || std::atoi(std::getenv("STRATA_PLAN_PARALLEL")) != 0;
     return v;
 }
+// #871 (upstream 6f7f680): a group whose routed experts cannot all be planned. With `skip` (the doorbell graph) the
+// host plan takes over (*skip = 0). Without it (the all-resident graph) there is no host plan to fall back on: the
+// plan is left empty (no expert runs on a stale pointer) and *plan_err (mapped host memory) is raised for the host.
+__dpct_inline__ void resident_plan_refuse(int32_t *pl, uint32_t *skip, uint32_t *plan_err) {
+    if (skip != nullptr) { *skip = 0; return; }
+    pl[0] = 0; pl[1] = 0; pl[2] = 0;
+    if (plan_err != nullptr) strata::sys_store(plan_err, 1u);
+}
 __dpct_inline__ void resident_plan_kernel(
     const int32_t *__restrict__ ids, int n, int k,
     const int32_t *__restrict__ res, int n_expert, const uint8_t *cache_base,
     const unsigned long long *slot_off, long long blob,
     int32_t *__restrict__ pl, long long capx, uint32_t *skip, uint32_t ring,
-    const unsigned long long *__restrict__ mir, bool par) {
+    const unsigned long long *__restrict__ mir, bool par, uint32_t *plan_err) {
 #if STRATA_PLAN_LOCAL
     // SYCL port: the host's exact loop, but over a local copy of the ids and their slots. One thread reading global
     // memory for every compare (n^2 of them) took 87 us per layer on the B70 - 4% of a decode round; a work-group
@@ -955,7 +963,7 @@ __dpct_inline__ void resident_plan_kernel(
         if (!valid || (sl < 0 && ma == 0)) s_bad = 1;
     }
     item.barrier(sycl::access::fence_space::local_space);
-    if (s_bad || n > 64) { if (tid == 0) *skip = 0; return; }   // n > 64 never happens (kVerifyMaxT * 10 = 60); refuse rather than read past
+    if (s_bad || n > 64) { if (tid == 0) resident_plan_refuse(pl, skip, plan_err); return; }   // n > 64 never happens (kVerifyMaxT * 10 = 60); refuse rather than read past
     if (par) {
         // SYCL port: the grouping in parallel, one thread per entry (unitrace: thread 0 alone took 73 us per layer,
         // ~3.5 ms of a decode round). The plan is the host loop's exactly: groups in order of first occurrence,
@@ -1004,7 +1012,7 @@ __dpct_inline__ void resident_plan_kernel(
         counts[1] = n;
         counts[2] = 0;
         sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
-        strata::sys_store(skip, ring);
+        if (skip != nullptr) strata::sys_store(skip, ring);   // #871: no doorbell in the all-resident graph
         return;
     }
     if (tid != 0) return;
@@ -1012,7 +1020,7 @@ __dpct_inline__ void resident_plan_kernel(
     // the original: one thread, the host's exact loop over global memory
     for (int i = 0; i < n; ++i) {
         const int32_t e = ids[i];
-        if (e < 0 || e >= n_expert || res[e] < 0) { *skip = 0; return; }
+        if (e < 0 || e >= n_expert || res[e] < 0) { resident_plan_refuse(pl, skip, plan_err); return; }
     }
 #endif
 #if !STRATA_PLAN_LOCAL
@@ -1063,7 +1071,7 @@ __dpct_inline__ void resident_plan_kernel(
     are needed.
     */
     sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
-    strata::sys_store(skip, ring);
+    if (skip != nullptr) strata::sys_store(skip, ring);   // #871: no doorbell in the all-resident graph
 #undef s_ids
 #undef S_RES
 }
@@ -1120,7 +1128,7 @@ void resident_plan_set_mirror(const int32_t* d_res, const unsigned long long* mi
 }
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream) {
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
     const unsigned long long* mir = nullptr;   // SYCL port: the layer's slice of the host-mirror table, if any
     if (g_mirror_table != nullptr && g_mirror_res != nullptr && res_layer >= g_mirror_res)
         mir = g_mirror_table + (res_layer - g_mirror_res);
@@ -1135,7 +1143,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                 exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
                     resident_plan_kernel(ids, n_entries, k, res_layer, n_expert,
                                          cache_base, slot_off, blob, plan, capx,
-                                         skip, ring, mir, par);
+                                         skip, ring, mir, par, plan_err);
                 });
     }
     check("resident_plan");
