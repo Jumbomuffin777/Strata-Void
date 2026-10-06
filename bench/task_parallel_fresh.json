@@ -1,0 +1,20 @@
+[
+ {"id": "f-logging", "category": "comparative analysis", "decomposable": true,
+  "prompt": "We need centralized logging for about 40 microservices producing roughly 2 TB of logs per day. Compare the ELK stack (Elasticsearch, Logstash, Kibana), Grafana Loki, and a managed service such as Datadog Logs on ingestion cost, query capabilities, retention, operational burden, and scaling limits. Then recommend one for a five-person platform team with a tight budget, and say what would change the recommendation.",
+  "check": {"type": "rubric", "rubric": ["ELK: powerful full-text search, heavy ops and storage cost at 2 TB/day", "Loki: indexes labels only, cheap object storage, weaker full-text queries", "managed: low ops, high per-GB cost at this volume", "retention and scaling discussed for each", "clear recommendation for small team + budget (likely Loki)", "conditions that change the recommendation"]}},
+ {"id": "f-incident", "category": "debugging / hypotheses", "decomposable": true,
+  "prompt": "After a deploy, our checkout service's error rate rose from 0.1% to 4%, but only for users in Europe, only on mobile, and only between 18:00 and 22:00 UTC. The deploy changed the payment SDK version, a CDN cache rule, and a database connection-pool setting. List the plausible hypotheses, explain how each one could produce exactly this pattern, and give the fastest test to confirm or rule out each, then the order you would run them in.",
+  "check": {"type": "rubric", "rubric": ["each of the three changes considered as a hypothesis", "explains why Europe + mobile + evening peak (traffic peak / regional CDN / SDK on mobile)", "connection pool exhaustion at peak load", "concrete fast test per hypothesis (rollback flag, logs by region/SDK version, pool metrics)", "ordered plan, cheapest/most likely first"]}},
+ {"id": "f-pricing", "category": "numerical/financial analysis", "decomposable": true,
+  "prompt": "A subscription app has 20,000 paying users at $10 per month with 5% monthly churn. Option A: raise the price to $12, expected to raise churn to 6%. Option B: keep $10 and add an annual plan at $96 per year that 30% of users would switch to, with annual users churning 1.5% per month (amortized). Compute the monthly recurring revenue for today and each option right after the change, the approximate customer lifetime value under each, and recommend an option with the main risks.",
+  "check": {"type": "rubric", "rubric": ["today MRR $200,000; LTV $10/0.05 = $200", "A: MRR $240,000; LTV 12/0.06 = $200", "B: 14,000 monthly x $10 = $140,000 + 6,000 x $8 = $48,000 -> $188,000 MRR-equivalent", "B blended LTV: monthly $200, annual 8/0.015 ~ $533", "recommendation with risks (cash now vs retention, assumptions)"]}},
+ {"id": "f-email", "category": "short writing", "decomposable": false,
+  "prompt": "Write a polite two-sentence email declining a meeting invitation for Thursday because of a scheduling conflict, and suggest Friday morning instead.",
+  "check": {"type": "rubric", "rubric": ["two sentences, polite, declines Thursday, proposes Friday morning"]}},
+ {"id": "f-sequential", "category": "sequential math", "decomposable": false,
+  "prompt": "A tank holds 500 liters. It starts full, loses 10% of its current volume every hour, and every 3 hours someone adds 40 liters right after that hour's loss. How many liters are in the tank after 6 hours? Show the calculation hour by hour.",
+  "check": {"type": "contains", "any": ["334.88", "334.9"]}},
+ {"id": "f-define", "category": "simple explanation", "decomposable": false,
+  "prompt": "What is a hash table, in two or three sentences?",
+  "check": {"type": "rubric", "rubric": ["key-value structure, hash function maps keys to buckets, average O(1) lookup"]}}
+]

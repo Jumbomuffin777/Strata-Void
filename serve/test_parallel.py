@@ -126,7 +126,12 @@ while True:
             out += 1
             time.sleep(STEP)
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
-        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 0", flush=True)
+        # an admission's reused count is a number of its own (1000 + its index), so every request's row can be told
+        # apart
+        admissions = globals().get("admissions", 0) + (slot is not None)
+        globals()["admissions"] = admissions
+        reused = 1000 + admissions if slot is not None else 0
+        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {reused}", flush=True)
         if slot is not None:
             cont = fin == "length" and max_new > 1
             if cont:
@@ -278,6 +283,13 @@ class ParallelService(unittest.TestCase):
             self.assertFalse(self.svc.status["busy"])
         self.assertEqual(sorted(r["output_tokens"] for r in self.svc.history),
                          sorted(len(reply[t]) + 1 for t in texts))
+        # each row's reused tokens are its own admission's, not those of whichever admission came last (engine.last
+        # is shared): every admission reports a different number, so two rows never share one
+        admissions = {1000 + k for k in range(1, 1 + sum(x.startswith("BGEN") for x in self.log.read_text().splitlines()))}
+        reused = [r["reused"] for r in self.svc.history if r["reused"]]
+        self.assertTrue(reused)
+        self.assertEqual(len(reused), len(set(reused)), reused)
+        self.assertTrue(set(reused) <= admissions, (reused, admissions))
         # never more than two in the slots at once (the fake logs how many were active at each admission)
         active = [int(x.split()[3]) for x in self.log.read_text().splitlines() if x.startswith("BGEN")]
         self.assertTrue(all(a <= 1 for a in active), active)
