@@ -33,6 +33,7 @@
 #include <atomic>
 #include <cstdint>
 #include <chrono>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -125,6 +126,40 @@ public:
     /// `wait = false` (SYCL port, single stage only): the commit graph is launched and left running so the drafter's
     /// round (its own queue, reads only the window's residuals) overlaps it; `commit_finish()` before the next run.
     bool commit(int n_keep, std::string& err, bool wait = true);
+
+    // ================================ SEVERAL SEQUENCES IN ONE WINDOW (upstream #465 batch slots, SYCL port) =====
+    //
+    // A batch window holds S INDEPENDENT sequences, one token each: row s is slot s, at slot s's own position,
+    // reading and writing slot s's own state (GDN recurrence and conv history, QSA K/V and indexer, PLE history),
+    // which lives in `slots[s]` - a session carved like this verifier's own (same layer range, same max_cells).
+    // Everything per row already (hyper-connections, dense projections, router, shared expert, routed experts,
+    // head) runs once over the S rows.  Row s's arithmetic is the single-token window's.  Greedy (or the slot's
+    // own Philox draw), no drafts.  `init_slots` once after `init` (S <= max_t).
+    //
+    // The stages of a layer split as a PIPELINE (Strata Void/SYCL): a batch window over the slot GROUP
+    // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's in-order queue (a
+    // batch window keeps every row, so the commit needs no host decision), and the host polls every stage that has
+    // a window in flight from one thread (batch_poll does not block).  Stage k can then run group g while stage k+1
+    // runs group g-1.  Rows of group `base` use hand-off rows [base, base + S): the hand-off is a ring of disjoint
+    // row ranges, so a stage writing group g+1's rows never touches the rows the next stage is reading for group g.
+    // SYCL: requires STRATA_VERIFY_NO_HOST (every routed expert resident; no per-layer host service).
+    bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
+    int n_slots() const { return (int) slots_.size(); }
+    bool batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err);
+    /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
+    /// -1 = an error (err).  Never blocks.
+    int batch_poll(std::string& err);
+    /// batch_launch + wait, stage after stage (the unpipelined batch window); out[t] = slot base+t's pick
+    bool run_slots(int base, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err);
+    bool batch_busy() const { return b_running_; }
+    void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
+        if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
+        if (next_) next_->set_slot_sampling(slot, sp);
+    }
+    const int32_t* batch_out() const { return b_out_; }
+    bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
+    int64_t batch_windows = 0;
+    double batch_gpu_ms = 0;   ///< launch -> observed complete, summed (host-observed, polling granularity)
     bool commit_finish(std::string& err);
     /// SYCL port: capture every window graph now (one per window size) instead of on first use, so the first
     /// request does not pay for them (a 2,400-node graph takes tens of ms to finalize on this backend).
@@ -172,6 +207,26 @@ public:
 
 private:
     bool capture(int T, std::string& err);
+    // batch windows (see init_slots)
+    std::vector<SessionState*> slots_;
+    bool batch_rec_ = false;               ///< record_window is capturing a batch window
+    int row_base_ = 0;                     ///< ... over slots [row_base_, row_base_ + T)
+    std::map<int, dpct::experimental::command_graph_exec_ptr> exec_bm_, commit_bm_;   ///< key base * 16 + S
+    int last_base_ = 0;
+    bool b_running_ = false;
+    sycl::event b_done_;
+    std::chrono::steady_clock::time_point b_t0_{};
+    int32_t b_out_[8] = {};
+    std::vector<strata::kernels::SamplerParams> slot_sp_;
+    bool sample_rows(int base, int S, std::string& err);
+    int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
+    int32_t* commitb_ = nullptr;
+    float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
+    void* arena_b_ = nullptr;
+    int64_t last_pos_b_[8] = {};
+    bool capture_batch(int base, int S, std::string& err);
+    bool capture_commit_batch(int base, int S, std::string& err);
+    bool stage_batch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err);
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
         s.greedy = true;
