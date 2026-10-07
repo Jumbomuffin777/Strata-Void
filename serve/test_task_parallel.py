@@ -216,6 +216,14 @@ class Orchestration(unittest.TestCase):
             b = FakeBackend(plan_json(2, effort=effort) if effort else plan_json(2))
             self.assertEqual(self.run_orch(b, 2).kind, "synthesize")      # a fixed count ignores the estimate
 
+    def test_fixed_count_above_the_slots_queues(self):
+        # 4 subtasks asked of an engine with 2 slots: never more than 2 at once, all 4 done, none timed out waiting
+        b = FakeBackend(plan_json(4), slots=2, delay=0.3)
+        out = self.run_orch(b, 4)
+        self.assertEqual(out.kind, "synthesize")
+        self.assertEqual(b.peak, 2)
+        self.assertEqual([w["finish"] for w in out.meta["worker_results"]], ["stop"] * 4)
+
     def test_workers_run_concurrently_then_synthesis(self):
         b = FakeBackend(plan_json(4), delay=0.3)
         t = time.time()

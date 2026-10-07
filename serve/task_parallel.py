@@ -49,7 +49,8 @@ class Config:
     total_timeout_s: float = 600.0       # planner + every worker attempt
     retries: int = 1                     # a failed worker (error / empty output) is tried again once
     gate_threshold: int = 2              # AUTO: the heuristic score a request needs before the planner is asked
-    auto_skip_effort: str = "low"  # AUTO answers normally when the planner rates the request this effort
+    auto_skip_effort: str = "low"        # AUTO answers normally when the planner rates the request at an effort listed
+    #                                      here (comma-separated; measured: "medium" requests still gained)
     internal_effort: str = "low"         # the reasoning effort every internal request is rendered with ("": the
     #                                      template's default) - one setting for all, so their shared prefix matches
 
@@ -469,7 +470,7 @@ class Orchestrator:
         # ---- the subtasks, at the same time
         self.progress(f"running {plan.parallelism} subtasks")
         deadline = t0 + cfg.total_timeout_s
-        results = self._run_workers(plan, shared, cancel, deadline)
+        results = self._run_workers(plan, shared, cancel, deadline, slots)
         t_work = time.time()
         meta.update(enabled=True, workers=plan.parallelism, workers_ms=_ms(t_plan, t_work))
         ok = [r for r in results if r is not None and r.text.strip() and not r.error]
@@ -529,9 +530,13 @@ class Orchestrator:
             r.finish = r.finish or "cancel"
         return r
 
-    def _run_workers(self, plan: Plan, shared: list, cancel: threading.Event, deadline: float) -> list:
+    def _run_workers(self, plan: Plan, shared: list, cancel: threading.Event, deadline: float,
+                     slots: int | None = None) -> list:
         cfg = self.cfg
         results: list = [None] * len(plan.subtasks)
+        # never more subtasks at once than the engine runs at once: a fixed count above it queues here, so a worker's
+        # timeout counts its own run, not its wait for a slot
+        gate = threading.Semaphore(max(1, slots or len(plan.subtasks)))
 
         def one(i: int, st: Subtask):
             call = Call("worker", shared + [{"role": "user", "content": worker_prompt(plan, st)}],
@@ -541,8 +546,15 @@ class Orchestrator:
             attempts = 0
             while True:
                 attempts += 1
-                left = deadline - time.time()
-                r = self._guarded(call, cancel, max(1.0, min(cfg.worker_timeout_s, left)))
+                while not gate.acquire(timeout=0.5):
+                    if cancel.is_set() or time.time() > deadline:
+                        results[i] = Result(error="cancelled" if cancel.is_set() else "timed out", attempts=attempts)
+                        return
+                try:
+                    left = deadline - time.time()
+                    r = self._guarded(call, cancel, max(1.0, min(cfg.worker_timeout_s, left)))
+                finally:
+                    gate.release()
                 r.attempts = attempts
                 bad = bool(r.error) or not r.text.strip()
                 if not bad or cancel.is_set() or attempts > cfg.retries or deadline - time.time() < 5.0 \
