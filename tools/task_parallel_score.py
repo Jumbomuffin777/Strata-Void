@@ -65,6 +65,28 @@ def auto_score(task: dict, content: str) -> dict | None:
         ok = [k for k, v in nums.items() if any(abs(f - v) <= max(0.005 * abs(v), 0.06) for f in found)]
         return {"passed": len(ok), "total": len(nums), "note": "missing " + ", ".join(k for k in nums if k not in ok)
                 if len(ok) < len(nums) else ""}
+    if kind == "longctx":
+        # the long-context tasks (tools/longctx_tasks.py): every expected name mentioned, every expected figure
+        # present (within 0.5 %, also written as "1.7 million" / "$1,715k")
+        low = (content or "").lower()
+        names = chk.get("contains_all") or []
+        # a name counts with or without its generic suffix ("Nimbus Dynamics Division" / "Nimbus Dynamics")
+        got_names = [n for n in names if n.lower() in low or re.sub(r"\s+(division|inc\.?|ltd\.?)$", "", n.lower()) in low]
+        text = re.sub(r"\{,\}|\\,", ",", content or "")
+        found = []
+        for m in re.finditer(r"(-?\d[\d,]*\.?\d*)\s*(million|m\b|thousand|k\b)?", text, re.I):
+            try:
+                v = float(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            unit = (m.group(2) or "").lower()
+            v *= 1e6 if unit in ("million", "m") else 1e3 if unit in ("thousand", "k") else 1
+            found.append(v)
+        nums = chk.get("numbers") or []
+        got_nums = [x for x in nums if any(abs(f - x) <= max(0.005 * abs(x), 0.5) for f in found)]
+        miss = [n for n in names if n not in got_names] + [str(x) for x in nums if x not in got_nums]
+        return {"passed": len(got_names) + len(got_nums), "total": len(names) + len(nums),
+                "note": ("missing " + ", ".join(miss)) if miss else ""}
     if kind == "contains":
         return {"passed": int(any(s.lower() in (content or "").lower() for s in chk["any"])), "total": 1, "note": ""}
     return None

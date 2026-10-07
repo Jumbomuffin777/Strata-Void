@@ -15,16 +15,27 @@ import http.client
 import json
 import sys
 import time
+import uuid
 from urllib.parse import urlparse
 
 
-def run_one(url: str, model: str, prompt: str, mode, max_tokens: int | None, temperature: float, timeout: float) -> dict:
+def run_one(url: str, model: str, prompt: str, mode, max_tokens: int | None, temperature: float, timeout: float,
+            cold: bool = True) -> dict:
     u = urlparse(url)
-    body = {"model": model, "messages": [{"role": "user", "content": prompt}], "stream": True,
+    msgs = [{"role": "user", "content": prompt}]
+    if cold:
+        # a run of its own: a server keeps what it read (prompt-prefix checkpoints, conversation caches), so the next
+        # mode over the same material would skip reading it.  A unique first line makes every run read everything.
+        msgs.insert(0, {"role": "system", "content": f"Run {uuid.uuid4().hex[:12]}."})
+    body = {"model": model, "messages": msgs, "stream": True,
             "temperature": temperature, "stream_options": {"include_usage": True}}
     # a mode is "off", "auto" or a worker count, optionally with "+b<N>": the request's reasoning_budget_tokens
     # (e.g. "off+b1536": an ordinary request whose thinking is capped like the synthesis' own)
-    base, _, budget = str(mode).partition("+b")
+    # ... and "/<compose>": the answer's form for this request (synthesis | sections | direct | auto), e.g. "4/direct"
+    mode_s, _, compose = str(mode).partition("/")
+    base, _, budget = mode_s.partition("+b")
+    if compose:
+        body["task_parallel_compose"] = compose
     if budget:
         body["reasoning_budget_tokens"] = int(budget)
     if base not in ("None", "off"):
@@ -101,6 +112,7 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--warm", action="store_true", help="no unique first line: a run may reuse what an earlier one read")
     a = ap.parse_args()
     tasks = json.load(open(a.tasks))
     if a.ids:
@@ -111,13 +123,14 @@ def main() -> int:
         for rep in range(a.repeat):
             for t in tasks:
                 for m in modes:
-                    rec = run_one(a.url, a.model, t["prompt"], m, a.max_tokens or None, a.temperature, a.timeout)
-                    rec.update(task=t["id"], category=t["category"], decomposable=t["decomposable"], rep=rep,
-                               at=time.time())
+                    rec = run_one(a.url, a.model, t["prompt"], m, a.max_tokens or None, a.temperature, a.timeout,
+                                  cold=not a.warm)
+                    rec.update(task=t["id"], category=t.get("category"), decomposable=t.get("decomposable"), cold=not a.warm,
+                               rep=rep, at=time.time(), **({"prompt_chars": len(t["prompt"])}))
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     f.flush()
                     tpm = rec.get("task_parallel") or {}
-                    print(f"{t['id']:20s} {m:5s} wall {rec['wall_s']:7.1f}s  first answer "
+                    print(f"{t['id']:20s} {m:9s} wall {rec['wall_s']:7.1f}s  first answer "
                           f"{rec['t_first_content'] or 0:6.1f}s  tokens {(rec['usage'] or {}).get('completion_tokens')}"
                           f"  workers {tpm.get('workers', '-')}  {tpm.get('decision', '')[:60]}"
                           f"{'  ERROR ' + str(rec['error'])[:80] if rec['error'] else ''}", flush=True)
