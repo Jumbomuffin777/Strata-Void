@@ -76,5 +76,7 @@ void native_expert_set_mode(int mode, int phase);
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
+/// SYCL: the fast IQ4_XS / IQ4_NL FP16 dequant (1 on, 0 the generic kernels, -1 STRATA_DQ_FAST; the same bits either way).
+void iq_set_dq_fast(int on);
 
 }  // namespace strata::kernels

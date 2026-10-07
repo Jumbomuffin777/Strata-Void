@@ -1983,6 +1983,101 @@ __dpct_inline__ void dequant_gu_kernel(
                             item_ct1.get_local_id(2));
 }
 
+// ---- fast FP16 dequant of IQ4_XS / IQ4_NL (the prompt path's expert weights): one work-item per 32-value
+// sub-block, its 16 code bytes read as two 8-byte loads (IQ4_XS) or eight 2-byte loads (IQ4_NL: 18-byte blocks are
+// only 2-aligned), four 16-byte vector stores.  The same arithmetic as dq_iq4_xs / dq_iq4_nl (d * kvalues, rounded to
+// FP16 once): the same bits, measured by moe_prefill_bench (`check`).  The generic kernels above use 32-thread
+// work-groups whose stores stride by 64 bytes per thread; these run 256-wide with contiguous stores.
+constexpr int8_t kIq4nlLut[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+__dpct_inline__ void iq4_sub_store(float d, const uint8_t (&b)[16], sycl::half* y) {
+    sycl::vec<sycl::half, 8> v;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = sycl::half(d * kIq4nlLut[b[8 * h + j] & 0xf]);
+        *reinterpret_cast<sycl::vec<sycl::half, 8>*>(y + 8 * h) = v;
+    }
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = sycl::half(d * kIq4nlLut[b[8 * h + j] >> 4]);
+        *reinterpret_cast<sycl::vec<sycl::half, 8>*>(y + 16 + 8 * h) = v;
+    }
+}
+
+__dpct_inline__ void iq4xs_sub(const block_iq4_xs* x, int ib, sycl::half* y) {
+    const int ls = ((x->scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x->scales_h >> 2 * ib) & 3) << 4);
+    const float d = (float) x->d * (ls - 32);
+    const uint64_t* q = reinterpret_cast<const uint64_t*>(x->qs + 16 * ib);
+    const uint64_t a = q[0], c = q[1];
+    uint8_t b[16];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { b[j] = (uint8_t) (a >> (8 * j)); b[8 + j] = (uint8_t) (c >> (8 * j)); }
+    iq4_sub_store(d, b, y);
+}
+
+__dpct_inline__ void iq4nl_block(const block_iq4_nl* x, sycl::half* y) {
+    const float d = (float) x->d;
+    const uint16_t* q = reinterpret_cast<const uint16_t*>(x->qs);
+    uint8_t b[16];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { const uint16_t w = q[j]; b[2 * j] = (uint8_t) w; b[2 * j + 1] = (uint8_t) (w >> 8); }
+    iq4_sub_store(d, b, y);
+}
+
+// the fast paths (STRATA_DQ_FAST=0: the generic kernels, the A/B); they need 8-aligned IQ4_XS blocks, 2-aligned IQ4_NL
+// blocks and a 16-aligned destination, else the generic kernel runs
+int g_dq_fast = -1;   // iq_set_dq_fast (the bench's A/B); -1: STRATA_DQ_FAST, default on
+bool dq_fast_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_DQ_FAST"); return e == nullptr || std::atoi(e) != 0; }();
+    return g_dq_fast < 0 ? v : g_dq_fast != 0;
+}
+
+bool dq_fast_flat(int t, const void* src, int64_t n, sycl::half* dst, sycl::queue* q) {
+    if (!dq_fast_on() || (t != 23 && t != 20) || n % 256 != 0 || ((uintptr_t) dst & 15) ||
+        ((uintptr_t) src & (t == 23 ? 7 : 1)))
+        return false;
+    const int64_t subs = n / 32;
+    const size_t wg = 256, groups = (size_t) ((subs + wg - 1) / wg);
+    if (t == 23) {
+        const block_iq4_xs* x = (const block_iq4_xs*) src;
+        q->parallel_for<class dq_fast_iq4xs_flat>(sycl::nd_range<1>(groups * wg, wg), [=](sycl::nd_item<1> it) {
+            const int64_t g = it.get_global_id(0);
+            if (g >= subs) return;
+            iq4xs_sub(x + g / 8, (int) (g % 8), dst + g * 32);
+        });
+    } else {
+        const block_iq4_nl* x = (const block_iq4_nl*) src;
+        q->parallel_for<class dq_fast_iq4nl_flat>(sycl::nd_range<1>(groups * wg, wg), [=](sycl::nd_item<1> it) {
+            const int64_t g = it.get_global_id(0);
+            if (g >= subs) return;
+            iq4nl_block(x + g, dst + g * 32);
+        });
+    }
+    return true;
+}
+
+bool dq_fast_gu(int t, const void* gate, const void* up, int64_t n_ff, int64_t per_row, sycl::half* dst, sycl::queue* q) {
+    if (!dq_fast_on() || t != 23 || ((uintptr_t) dst & 15) || ((uintptr_t) gate & 7) || ((uintptr_t) up & 7))
+        return false;
+    const int64_t per_mat = n_ff * per_row * 8;          // sub-blocks of one role matrix
+    const int64_t total = 2 * per_mat;
+    const size_t wg = 256, groups = (size_t) ((total + wg - 1) / wg);
+    const block_iq4_xs* xg = (const block_iq4_xs*) gate;
+    const block_iq4_xs* xu = (const block_iq4_xs*) up;
+    q->parallel_for<class dq_fast_iq4xs_gu>(sycl::nd_range<1>(groups * wg, wg), [=](sycl::nd_item<1> it) {
+        const int64_t g = it.get_global_id(0);
+        if (g >= total) return;
+        const int parity = g >= per_mat;
+        const int64_t s = parity ? g - per_mat : g;        // sub-block within the role matrix
+        const int64_t i = s / 8, ib = s % 8;                // superblock i, sub-block ib
+        const int64_t r = i / per_row, c = i % per_row;
+        iq4xs_sub((parity ? xu : xg) + i, (int) ib, dst + ((2 * r + parity) * per_row + c) * QK_K + 32 * ib);
+    });
+    return true;
+}
+
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
@@ -2287,6 +2382,7 @@ void launch_down(dpct::dim3 grid, dpct::queue_ptr s,
 }  // namespace
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
+void iq_set_dq_fast(int on) { g_dq_fast = on; }
 bool iq_old_kernels() { return g_old_kernels; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
@@ -2352,6 +2448,7 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
     if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    if (dq_fast_flat(t, src, n, (sycl::half*) dst, strata::q_of(stream))) return;
     {
 
         auto exp_props = sycl::ext::oneapi::experimental::properties{
@@ -2452,6 +2549,7 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     // checked like the other entry points: an unknown type used to leave `dst` unwritten, a wrong prompt and no error
     if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd); std::exit(1); }
     const int64_t per_row = n_embd / 256;
+    if (dq_fast_gu(t, gate, up, n_ff, per_row, (sycl::half*) dst, strata::q_of(stream))) return;
     {
 
         auto exp_props = sycl::ext::oneapi::experimental::properties{
