@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import codecs
 import ctypes
+import dataclasses
 import json
 import os
 import queue
@@ -59,7 +60,7 @@ from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
-from serve import task_parallel  # noqa: E402
+from serve import context_pool, task_parallel  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -1759,6 +1760,7 @@ class Service:
         # request asks) and its limits (the config's "task_parallel" object)
         self.task_parallel_default = None
         self.task_parallel_cfg = task_parallel.Config()
+        self.task_parallel_provider = None              # a ContextProvider (serve/context_pool.py), from the config
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
 
@@ -2779,6 +2781,17 @@ class ServiceBackend:
     def count_tokens(self, call) -> int:
         return len(self.svc.render_internal(call.messages, call.thinking, self.effort))
 
+    def count_text(self, text: str) -> int:
+        return len(self.svc.tok.encode(text))
+
+    def slot_context(self) -> int:
+        """A batch slot's context when the engine's slots are smaller than its solo context (--slot-context), else 0."""
+        return int(getattr(self.svc.engine, "slot_ctx", 0) or 0)
+
+    def busy(self) -> int:
+        """Slots other requests hold right now (AUTO's load signal)."""
+        return sum(1 for b in (getattr(self.svc.engine, "slot_busy", None) or []) if b)
+
     def generate(self, call, cancel: threading.Event):
         r = task_parallel.Result(t_start=time.time())
         ids = self.svc.render_internal(call.messages, call.thinking, self.effort)
@@ -2790,6 +2803,16 @@ class ServiceBackend:
         sampling["reasoning_budget_tokens"] = int(call.reasoning_budget or 0)
         if (getattr(self.svc.engine, "info", {}) or {}).get("prefix_ckpt"):
             n = self.svc.internal_prefix_len(call.shared_prefix, ids, self.effort)
+            if call.common_with:
+                # a deeper prefix the sibling calls share (e.g. the answer's outline after the notes): checkpoint there
+                other = self.svc.render_internal(call.common_with, call.thinking, self.effort)
+                k = 0
+                for a, b in zip(ids, other):
+                    if a != b:
+                        break
+                    k += 1
+                if (n or 0) < k < len(ids) - 1:
+                    n = k
             if n:
                 sampling["_prefix_ckpt"] = n
         r.prompt_tokens = len(ids)
@@ -2800,6 +2823,8 @@ class ServiceBackend:
                     r.t_first = time.time()
                 if x.kind == "content":
                     text.append(x.text)
+                    if call.on_text is not None and x.text:
+                        call.on_text(x.text)
             elif kind == "done":
                 r.finish = x.get("finish", "")
                 r.completion_tokens = x.get("completion_tokens", 0)
@@ -3536,6 +3561,14 @@ def make_handler(svc: Service):
             if tp_value is not None:
                 tp_mode = task_parallel.parse_mode(tp_value)  # a bad value is a 400
                 # not with tools/MCP, a structured response_format or images (v1): such a request runs as usual
+                items = req.get("context_items")
+                if items is not None and not isinstance(items, list):
+                    return self._json(400, {"error": {"type": "invalid_request_error",
+                                                      "message": "context_items must be a list"}})
+                comp = req.get("task_parallel_compose")
+                if comp is not None and comp not in ("synthesis", "sections", "direct", "auto"):
+                    return self._json(400, {"error": {"type": "invalid_request_error", "message":
+                                                      "task_parallel_compose: synthesis, sections, direct or auto"}})
                 if not tp_mode.off and not tools and validator is None and not images_of(messages):
                     return self._openai_task_parallel(req, messages, kw, tp_mode, max_req)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
@@ -3589,7 +3622,10 @@ def make_handler(svc: Service):
             client_thinks = kw.get("enable_thinking", True) is not False
             effort = svc.task_parallel_cfg.internal_effort
             backend = ServiceBackend(svc, req, effort)
-            orch = task_parallel.Orchestrator(backend, svc.task_parallel_cfg)
+            cfg = svc.task_parallel_cfg
+            if req.get("task_parallel_compose") and req["task_parallel_compose"] != cfg.compose:
+                cfg = dataclasses.replace(cfg, compose=req["task_parallel_compose"])   # this request's answer form
+            orch = task_parallel.Orchestrator(backend, cfg)
             events: "queue.Queue" = queue.Queue()
             orch.progress = lambda stage: events.put(("progress", stage))
             if stream:
@@ -3597,8 +3633,9 @@ def make_handler(svc: Service):
             outcome = None
             def work():
                 try:
-                    events.put(("outcome", orch.run(messages, mode, cancel,
-                                                    "on" if client_thinks else "off")))
+                    events.put(("outcome", orch.run(messages, mode, cancel, "on" if client_thinks else "off",
+                                                    context_items=req.get("context_items"),
+                                                    provider=svc.task_parallel_provider)))
                 except Exception as e:          # the orchestration's own bug: answer as usual, say why
                     events.put(("outcome", task_parallel.Outcome("direct", meta={
                         "mode": "auto" if mode.kind == "auto" else str(mode.workers), "enabled": False,
@@ -3625,6 +3662,9 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 return
             t_synth = time.time()
+            if outcome.kind == "composed":
+                return self._task_parallel_composed(req, messages, outcome, t_synth, stream, diagnostics, cancel,
+                                                    effort)
             if outcome.kind == "synthesize":
                 synth = outcome.synthesis
                 ids = svc.render_internal(synth.messages, synth.thinking, effort)
@@ -3633,6 +3673,10 @@ def make_handler(svc: Service):
                 if room < 1:
                     raise ValueError(f"the synthesis prompt ({len(ids)} tokens) leaves no room to answer")
                 max_new = min(max_req, room) if max_req and max_req > 0 else room
+                cap = svc.task_parallel_cfg.synthesis_max_tokens
+                one = (outcome.meta or {}).get("compose") == "one answer, shared prefix"   # an ordinary answer: no cap
+                if not (max_req and max_req > 0) and cap > 0 and not one:
+                    max_new = min(max_new, cap)      # measured: a synthesis over long notes can loop for 50K tokens
                 sampling = dict(req)
                 if req.get("reasoning_budget_tokens") is None and synth.reasoning_budget:
                     sampling["reasoning_budget_tokens"] = synth.reasoning_budget
@@ -3684,6 +3728,56 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+
+        def _task_parallel_composed(self, req, messages, outcome, t_start, stream, diagnostics, cancel, effort):
+            """The answer written in sections at the same time (task_parallel.Composer): its text, in order, is this
+            request's answer - streamed as it is written (the first section live, each later one once the ones before
+            it are out).  No model call happens here: the sections' internal requests are already running."""
+            comp, meta = outcome.composer, outcome.meta
+            cid, created, model = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time()), svc.model_for(req)
+            try:
+                pt = len(svc.render_internal(messages, "off", effort))
+            except Exception:  # noqa: BLE001 - only the usage count
+                pt = 0
+
+            def chunk(delta, finish=None):
+                return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+
+            def final():
+                m = task_parallel.finish_meta(meta, t_start, 0, 0, diagnostics=diagnostics, composed=comp.finish())
+                ct = m.get("writer_tokens", 0)
+                return m, {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+            if not stream:
+                text = "".join(comp.stream())
+                if cancel.is_set():
+                    self._note(outcome="disconnected")
+                    return
+                m, usage = final()
+                return self._json(200, {"id": cid, "object": "chat.completion", "created": created, "model": model,
+                                        "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                                                     "finish_reason": "stop"}],
+                                        "usage": usage, "task_parallel": m})
+            try:
+                self.wfile.write(b"data: " + json.dumps(chunk({"role": "assistant", "content": ""})).encode() + b"\n\n")
+                self.wfile.flush()
+                for piece in comp.stream():
+                    self.wfile.write(b"data: " + json.dumps(chunk({"content": piece}), ensure_ascii=False).encode()
+                                     + b"\n\n")
+                    self.wfile.flush()
+                if cancel.is_set():
+                    raise OSError("client gone")
+                m, usage = final()
+                last = chunk({}, "stop")
+                last["usage"] = usage
+                self.wfile.write(b"data: " + json.dumps(last).encode() + b"\n\n")
+                tail = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+                        "choices": [], "task_parallel": m}
+                self.wfile.write(b"data: " + json.dumps(tail, ensure_ascii=False).encode() + b"\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+            except OSError:
+                self._note(outcome="disconnected")
+                cancel.set()
 
         def _responses(self, req):
             """#451: POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
@@ -4344,8 +4438,16 @@ def main() -> int:
     if tp_cfg is not None:
         try:
             if isinstance(tp_cfg, dict):
-                svc.task_parallel_cfg = task_parallel.Config.from_dict(tp_cfg)
+                svc.task_parallel_cfg = task_parallel.Config.from_dict(
+                    {k: v for k, v in tp_cfg.items() if k != "context_provider"})
                 default = tp_cfg.get("default")
+                prov = tp_cfg.get("context_provider")
+                if prov is not None:                    # a generic JSON retrieval endpoint (serve/context_pool.py)
+                    if not isinstance(prov, dict) or not isinstance(prov.get("url"), str):
+                        raise ValueError("task_parallel.context_provider needs a \"url\"")
+                    svc.task_parallel_provider = context_pool.HttpContextProvider(
+                        prov["url"], float(prov.get("timeout_s", 5.0)), dict(prov.get("headers") or {}))
+                    print(f"[strata] task-parallel context provider: {prov['url']}", flush=True)
             else:
                 default = tp_cfg                        # "task_parallel": "auto" - just the default mode
             if default is not None and not task_parallel.parse_mode(default).off:
