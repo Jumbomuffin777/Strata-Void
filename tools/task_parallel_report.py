@@ -16,7 +16,8 @@ def row(r: dict) -> dict:
     tp = r.get("task_parallel") or {}
     u = r.get("usage") or {}
     comp = u.get("completion_tokens") or 0
-    first = r.get("t_first_content") or r.get("t_first_reasoning")
+    seen = [x for x in (r.get("t_first_reasoning"), r.get("t_first_content")) if x]
+    first = min(seen) if seen else None
     out = {"task": r["task"], "mode": r["mode"], "wall_s": r["wall_s"], "first_answer_s": r.get("t_first_content"),
            "finish": r.get("finish"), "answer_chars": len(r.get("content") or ""),
            "answer_tokens": comp, "workers": tp.get("workers") if tp.get("enabled") else 1,
@@ -35,12 +36,11 @@ def row(r: dict) -> dict:
                    generated_total=tp.get("total_generated_tokens") or comp,
                    prompt_read=(tp.get("planner_prompt_tokens") or 0)
                    + sum((w.get("prompt_tokens") or 0) - (w.get("reused_tokens") or 0) for w in wr)
-                   + (u.get("prompt_tokens") or 0)
-                   - ((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0))
+                   + (u.get("prompt_tokens") or 0))   # the synthesis prompt in full (an upper bound)
     else:
-        out.update(generated_total=(tp.get("total_generated_tokens") or 0) + comp if tp else comp,
-                   prompt_read=(u.get("prompt_tokens") or 0)
-                   - ((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0))
+        # an ordinary request (or AUTO answering normally after a plan): its prompt once, plus the plan's
+        out.update(generated_total=(tp.get("planner_tokens") or 0) + comp,
+                   prompt_read=(u.get("prompt_tokens") or 0) + (tp.get("planner_prompt_tokens") or 0))
     return out
 
 

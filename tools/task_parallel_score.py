@@ -55,6 +55,16 @@ def auto_score(task: dict, content: str) -> dict | None:
             if r[0] > best[0] or best[2] == "no code block":
                 best = r
         return {"passed": best[0], "total": best[1], "note": best[2]}
+    if kind == "numbers":
+        # every numeric expectation must appear in the answer: some number within 0.5 % (at least 0.06 absolute,
+        # for rounded percentages and years) of it; text expectations are left to the rubric
+        text = re.sub(r"\{,\}|\\,|(?<=\d) (?=\d{3}\b)", ",", content or "")      # LaTeX / spaced thousands
+        found = [float(x.replace(",", "")) for x in re.findall(r"-?\d[\d,]*\.?\d*", text)
+                 if x.replace(",", "").replace(".", "").lstrip("-").isdigit()]
+        nums = {k: v for k, v in chk["expected"].items() if isinstance(v, (int, float))}
+        ok = [k for k, v in nums.items() if any(abs(f - v) <= max(0.005 * abs(v), 0.06) for f in found)]
+        return {"passed": len(ok), "total": len(nums), "note": "missing " + ", ".join(k for k in nums if k not in ok)
+                if len(ok) < len(nums) else ""}
     if kind == "contains":
         return {"passed": int(any(s.lower() in (content or "").lower() for s in chk["any"])), "total": 1, "note": ""}
     return None
