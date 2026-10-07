@@ -239,6 +239,8 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(gr_bench PRIVATE strata_kernels)
   add_executable(xmx_gemm_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/xmx_gemm_bench.cpp)   # XMX quantized GEMM vs dequant+oneMKL
   target_link_libraries(xmx_gemm_bench PRIVATE strata_kernels strata_prefill)   # -qmkl for the oneMKL reference
+  add_executable(moe_prefill_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/moe_prefill_bench.cpp)   # prompt-path expert costs
+  target_link_libraries(moe_prefill_bench PRIVATE strata_kernels strata_prefill)
   # one native expert three ways on real GGUF rows (ggml reference, CPU path, GPU native_expert_grouped):
   #   native_expert_parity <shard1.gguf> [layer ...]
   if(STRATA_NATIVE_EXPERTS)
