@@ -490,6 +490,11 @@ class StrataEngine:
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
+        # --slot-context: the slots hold fewer cells than a solo request (INFO slot_ctx=N); a request that does not fit
+        # one runs on the solo path only (0: a slot holds as much as the solo path)
+        self.slot_ctx = int(self.info.get("slot_ctx") or 0) if self.batch else 0
+        if self.slot_ctx >= int(self.max_context or 0):
+            self.slot_ctx = 0           # as much as the solo path: nothing changes (the known-good behavior)
         if asked and self.batch != asked:
             print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
@@ -872,6 +877,17 @@ class StrataEngine:
         with self.slot_cv:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
+    def _slots_empty(self, cancel):
+        """Heartbeats until no slot is busy (a request too long for a slot waits for this; see generate_batched)."""
+        while True:
+            with self.slot_cv:
+                if not any(self.slot_busy):
+                    return True
+                self.slot_cv.wait(timeout=1.0)
+            if cancel.is_set():
+                return False
+            yield None
+
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
         - and when another request arrives meanwhile, this one is STOPped and continues in a batch slot (BGEN with
@@ -896,6 +912,28 @@ class StrataEngine:
         stop_sent = False
         yields, solo_again = 0, 0
         try:
+            if self.slot_ctx and len(prompt) + left + 8 > self.slot_ctx:
+                # --slot-context: too long for a slot.  The solo path once the slots are empty (holding the control
+                # lines admits nobody meanwhile), not stopped for others (it could not continue in a slot)
+                btrace(f"solo-only: {len(prompt)}+{left} > slot_ctx {self.slot_ctx}")
+                ok = yield from self._slots_empty(cancel)
+                if not ok:
+                    return
+                head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                phase = "solo"
+                self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
+                for x in self._control(cancel, pending.append):
+                    while pending:
+                        t = pending.pop(0)
+                        out.append(t)
+                        yield t
+                    if x is None:
+                        yield None
+                phase = "none"
+                while pending:
+                    yield pending.pop(0)
+                return
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
                     ok = yield from self._take_control(cancel, len(prompt))

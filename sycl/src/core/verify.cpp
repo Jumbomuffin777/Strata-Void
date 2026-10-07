@@ -1901,12 +1901,20 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         err = "verify: init_slots needs 1.." + std::to_string(max_t_) + " sessions";
         return false;
     }
+    // a slot may hold fewer cells than the stage's own session (--slot-context): every row of a batch window reads
+    // and writes its own slot's K/V, indexer and page table (its own max_cells), and stage_batch bounds each row by
+    // its slot's context; only the block-score stride (max_blocks_) is the stage's, which covers the smaller slot
     for (SessionState* x : slots) {
         if (x == nullptr || x->layer_lo != ss_->layer_lo || x->layer_hi != ss_->layer_hi ||
-            x->max_cells != ss_->max_cells || x->gdn_ord0 != ss_->gdn_ord0 || x->qsa_ord0 != ss_->qsa_ord0) {
-            err = "verify: a slot's session is not carved like the stage's own (layer range, context)";
+            x->max_cells > ss_->max_cells || x->gdn_ord0 != ss_->gdn_ord0 || x->qsa_ord0 != ss_->qsa_ord0) {
+            err = "verify: a slot's session is not carved like the stage's own (layer range, at most its context)";
             return false;
         }
+        for (int64_t j = 0; j < x->qsa_alloc; ++j)
+            if (x->qsa_states[x->qsa_ord0 + j].max_cells > ss_->qsa_states[ss_->qsa_ord0 + j].max_cells) {
+                err = "verify: a slot's attention state holds more cells than the stage's own";
+                return false;
+            }
     }
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t S = (int64_t) slots.size(), CB = 2 + max_t_;

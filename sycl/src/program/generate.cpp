@@ -511,6 +511,11 @@ struct Options {
     /// in batch slots, one token each per batch window (0 = off).  `BGEN <slot> <max_new> ...` reads its prompt and
     /// its first token through the solo path, then continues in slot <slot> (`BT <slot> <id>`, then `BDONE ...`).
     int batch = 0;
+    /// --slot-context N: the batch slots' own capacity (cells), when smaller than --max-context (0: the same).  A
+    /// request whose prompt + max_new does not fit a slot runs on the solo path only (the server knows: INFO slot_ctx).
+    /// Slot sessions cost VRAM per slot, so this is what lets one long-context request and several shorter ones share
+    /// the cards: e.g. --max-context 131072 --batch 6 --slot-context 32768.
+    int64_t slot_context = 0;
     /// The --batch slots in this many groups pipelined through the stages of a layer split (stage k runs one group
     /// while stage k+1 runs another).  1 = every slot in one window, stage after stage.
     int batch_groups = 1;
@@ -1483,6 +1488,7 @@ int main(int argc, char **argv) try {
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--batch-groups") o.batch_groups = std::atoi(next("--batch-groups"));
+        else if (a == "--slot-context") o.slot_context = std::atoll(next("--slot-context"));
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp") o.mtp = next("--mtp");
@@ -3161,16 +3167,17 @@ int main(int argc, char **argv) try {
             return 2;
         }
         bslot_ss.resize(1 + stages.size());
+        const int64_t slot_cells = o.slot_context > 0 ? std::min(o.slot_context, o.max_context) : o.max_context;
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
             const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
             const strata::core::OnDevice on_k(dev);
-            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
+            const uint64_t bytes = strata::core::session_bytes(g, slot_cells, K, lo, hi);
             for (int b = 0; b < o.batch; ++b) {
                 auto u = std::make_unique<strata::core::SessionState>();
                 void* buf = sycl::malloc_device(bytes, dpct::get_in_order_queue());
-                if (buf == nullptr || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
+                if (buf == nullptr || strata::core::session_init(g, slot_cells, K, buf, *u, lo, hi) == 0) {
                     std::fprintf(stderr, "strata generate: --batch: slot %d's session on CUDA%d does not fit (%.2f GiB each)\n",
                                  b, dev, (double) bytes / 1073741824.0);
                     return 1;
@@ -3182,8 +3189,9 @@ int main(int argc, char **argv) try {
             dpct::get_current_device().queues_wait_and_throw();
             size_t fb = 0, tb = 0;
             dpct::get_current_device().get_memory_info(fb, tb);
-            std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.3f GiB each); %.2f GiB free\n",
-                         o.batch, dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
+            std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.3f GiB each, %lld cells); %.2f GiB "
+                         "free\n", o.batch, dev, (double) bytes / 1073741824.0, (long long) slot_cells,
+                         (double) fb / 1073741824.0);
         }
     }
 
@@ -6184,7 +6192,9 @@ int main(int argc, char **argv) try {
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         // --batch (SYCL port of #465 at 9461f5e): slots do not keep their conversations (slot_cache=0)
                         (std::string(" prefix_ckpt=1") +
-                         (o.batch > 0 ? " batch_slots=" + std::to_string(o.batch) + " slot_cache=0" : "")).c_str());
+                         (o.batch > 0 ? " batch_slots=" + std::to_string(o.batch) + " slot_cache=0 slot_ctx=" +
+                                        std::to_string(o.slot_context > 0 ? std::min(o.slot_context, o.max_context) : o.max_context)
+                                      : "")).c_str());
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -6389,6 +6399,7 @@ int main(int argc, char **argv) try {
             Clock::time_point t0;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        const int64_t slot_cap = o.slot_context > 0 ? std::min(o.slot_context, o.max_context) : o.max_context;
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
@@ -6480,7 +6491,7 @@ int main(int argc, char **argv) try {
                     ++bt_rows;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
-                                    : sl.p + 2 > o.max_context ? "length" : nullptr;
+                                    : sl.p + 2 > slot_cap ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
@@ -6786,6 +6797,13 @@ int main(int argc, char **argv) try {
             if (n + max_new + 8 > o.max_context) {
                 std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
                             (long long) max_new, (long long) o.max_context);
+                continue;
+            }
+            if (admit_slot >= 0 && n + admit_max_new + 8 > slot_cap) {   // --slot-context: it cannot continue in a slot
+                std::printf("ERR BGEN: prompt (%lld tokens) + max_new (%lld) exceeds a slot's context (%lld)\n",
+                            (long long) n, (long long) admit_max_new, (long long) slot_cap);
+                std::fflush(stdout);
+                admit_slot = -1;
                 continue;
             }
             bool bad = false;

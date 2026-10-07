@@ -37,7 +37,8 @@ def reader():
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
-      (" slot_cache=1" if "--slotcache" in args else ""), flush=True)
+      (" slot_cache=1" if "--slotcache" in args else "") +
+      (f" slot_ctx={args[args.index('--slotctx') + 1]}" if "--slotctx" in args else ""), flush=True)
 print("READY 4096 stop", flush=True)
 LONG = list(b"LONGREPLY")
 def reply(ids):            # the rest of the reply after what the prompt already ends with (a request continued)
@@ -197,7 +198,7 @@ class PickSlot(unittest.TestCase):
 class ParallelService(unittest.TestCase):
     """The real StrataEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False):
+    def start(self, slots, fit=None, slot_cache=False, slot_ctx=None):
         import serve.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_strata.py"
@@ -206,6 +207,7 @@ class ParallelService(unittest.TestCase):
         real = server.subprocess.Popen
         extra = ["--batch", str(slots)] + (["--fit", str(fit)] if fit is not None else []) + ["--log", str(self.log)]
         extra += ["--slotcache"] if slot_cache else []
+        extra += ["--slotctx", str(slot_ctx)] if slot_ctx else []
         with mock.patch.object(server.subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = StrataEngine("strata", extra)
@@ -293,6 +295,43 @@ class ParallelService(unittest.TestCase):
         # never more than two in the slots at once (the fake logs how many were active at each admission)
         active = [int(x.split()[3]) for x in self.log.read_text().splitlines() if x.startswith("BGEN")]
         self.assertTrue(all(a <= 1 for a in active), active)
+
+    def test_too_long_for_a_slot_runs_solo(self):
+        """--slot-context: slots smaller than the solo path (INFO slot_ctx=N).  A request that does not fit one runs on
+        the solo path once the slots are empty, and is not stopped (it could not continue in a slot); short requests
+        still share the slots."""
+        self.start(2, slot_ctx=300)
+        self.assertEqual(self.engine.slot_ctx, 300)
+        long_q = "LONGREPLY " + "context " * 40          # ~330 prompt tokens + max_tokens: over 300
+        res, errors = {}, []
+
+        def go(t, mt):
+            try:
+                res[t] = self.chat(t, max_tokens=mt)["choices"][0]["message"]["content"]
+            except Exception as e:   # noqa: BLE001
+                errors.append(e)
+        shorts = ["short one LONGREPLY", "short two"]
+        th = [threading.Thread(target=go, args=(t, 64)) for t in shorts]
+        th[0].start()
+        time.sleep(0.15)
+        th.append(threading.Thread(target=go, args=(long_q, 64)))
+        th[-1].start()
+        time.sleep(0.05)
+        th[1].start()
+        for t in th:
+            t.join(30)
+        self.assertEqual(errors, [])
+        self.assertEqual(res[long_q], "ok, " + "la " * 15 + "done.")
+        self.assertEqual(res["short two"], "ok, done.")
+        log = [x.split() for x in self.log.read_text().splitlines() if x.startswith(("GEN", "BGEN"))]
+        long_rows = [x for x in log if int(x[2]) > 300]
+        self.assertTrue(long_rows and all(x[0] == "GEN" for x in long_rows), log)
+        with self.svc.status_lock:
+            self.assertEqual(self.svc.live_reqs, {})
+
+    def test_full_size_slots_change_nothing(self):
+        self.start(2, slot_ctx=4096)
+        self.assertEqual(self.engine.slot_ctx, 0)
 
     def race(self, first, second, delay=0.15, max_tokens=64):
         """`first` sent, `second` after `delay` seconds; -> {text: (reply, seconds it took)}"""
