@@ -30,6 +30,12 @@ The upstream README (with translations) is kept as [README.strata.md](README.str
 
 ## Task-Parallel Requests in one picture
 
+Batching normally uses concurrency to serve several independent requests. Strata Void applies that capacity
+within **one complex request**: a planner decomposes suitable work, the subtasks run concurrently in Strata's
+existing batch slots using one loaded model, and synthesis combines their results into one answer. AUTO selects
+when to split the work; shared-context checkpoints avoid rereading a common prefix where the engine supports
+them. The aim is shorter completion time for decomposable work; single-stream token generation is unchanged.
+
 ```mermaid
 flowchart TD
     A["one request (task_parallel: auto | 2..8)"] --> G{"AUTO gate<br/>(no model call)"}
@@ -47,9 +53,9 @@ flowchart TD
     end
 ```
 
-- The subtasks are ordinary internal requests running **concurrently in the engine's batch slots** (`--batch N`):
-  no extra model instance, no extra VRAM per request. Each one restores the shared prefix (the request, and a long
-  document if there is one) from the engine's checkpoint instead of reading it again.
+- The subtasks are ordinary internal requests running **concurrently in the engine's batch slots** (`--batch N`),
+  using the same loaded model. On engines with shared-prefix checkpoint support (this fork's SYCL engine), each
+  step can restore the common context instead of reading it again; each slot still has its own KV state.
 - Workers hand over **work products** (findings, figures, code), never their reasoning. Only the final answer
   reaches the client.
 - It always costs **more compute** than one request (plan + subtasks + synthesis). Every response says how much.
@@ -267,8 +273,9 @@ Strata Void is free and open source. If it has helped your local LLM setup and y
   ([upstream](https://github.com/Niko1221/Strata)); the SYCL port was started by maxfridbe (#423).
 - **Task-Parallel Requests**, the Strata Void direction and the Zability test system: **Jumbomuffin777**.
   Implementation, debugging and benchmarking were AI-assisted (Claude) under his direction.
-- Running several sub-requests for one task is a known idea (parallel decoding, map-reduce over documents, agent
-  orchestration); this repository is an independently designed serving extension for Strata, not a claim to have
-  invented parallel LLM reasoning.
+- Task decomposition, map-reduce over documents and parallel LLM execution are established concepts. Strata Void
+  integrates them into Strata's batching and serving architecture: automatic task selection, concurrent subtasks,
+  synthesis into one answer and shared-context checkpoint reuse where supported. These build on upstream's engine
+  and batch slots; no claim is made to have invented parallel reasoning.
 
 See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md). License: MIT ([LICENSE](LICENSE)), as upstream.
