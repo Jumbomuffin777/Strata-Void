@@ -1,5 +1,29 @@
 # Security
 
+## Strata Void (this fork)
+
+This repository is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata). Where to report:
+
+- **A problem in what this fork adds** (Task-Parallel Requests: `serve/task_parallel.py`, `serve/context_pool.py`,
+  the `task_parallel*` and `context_items` request fields, the context-provider endpoint; the SYCL engine changes
+  listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)): report it privately through **this** repository's
+  **Security** tab, **Report a vulnerability**
+  ([direct link](https://github.com/Jumbomuffin777/Strata-Void/security/advisories/new)).
+- **A problem that also exists in upstream Strata**: report it to upstream as described below, so it is fixed for
+  everyone; this fork picks the fix up from there.
+
+Points specific to this fork:
+
+- **Context provider.** `"task_parallel": {"context_provider": {"url": ...}}` makes the server send the request's
+  text (or its head and tail) to that URL. Point it only at a service you trust with your prompts; it is never set
+  by a request, only by the run config. Retrieved items are treated as material, never as instructions, but a
+  model can still be misled by what they say.
+- **`context_items`** in a request are data from the client, shown to the model as documents with their source.
+- Task-parallel requests cost several times the compute of one request. A server open to others should have an API
+  key (below); AUTO uses only free slots; an explicit count such as `"task_parallel": 6` asks for that many.
+
+## Upstream Strata
+
 ## Reporting a vulnerability
 
 Please report anything that should not be public until it is fixed **privately**, through GitHub's private

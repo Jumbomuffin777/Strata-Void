@@ -1,0 +1,30 @@
+name: Benchmark results from your hardware
+description: Task-Parallel Requests (or the Arc prompt path) measured on another GPU, model or engine
+labels: [results]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Results from other hardware are the most useful thing you can send: CUDA, ROCm, other Arc cards, other models.
+        Run `tools/task_parallel_bench.py` as in docs/BENCHMARKS.md ("Reproduce") and compare modes on one machine.
+  - type: textarea
+    id: system
+    attributes:
+      label: System
+      description: GPUs (and how many), VRAM, CPU, RAM, OS, driver/runtime, engine (SYCL / CUDA / HIP) and commit.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Model and engine settings
+      description: Model, quant, context, KV format, --batch / --batch-groups, --slot-context, layer split, spec settings.
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: Wall-clock per task and mode (off, N, N/direct, auto), and checks or quality notes. A table is fine; attach the results .jsonl if you can.
+    validations:
+      required: true

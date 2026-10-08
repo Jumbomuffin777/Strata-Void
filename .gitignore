@@ -56,3 +56,7 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# Strata Void: benchmark outputs (docs/BENCHMARKS.md) and downloaded weights stay out of git
+/results/
+*.safetensors

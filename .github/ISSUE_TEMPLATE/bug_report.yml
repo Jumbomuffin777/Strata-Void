@@ -1,0 +1,48 @@
+name: Bug report
+description: Something in Strata Void does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A problem that also happens with upstream Strata (same request, `task_parallel` off, upstream build) belongs
+        upstream: https://github.com/Niko1221/Strata/issues. Security problems: use the Security tab, not an issue.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Task-Parallel Requests (planner, AUTO, subtasks, synthesis, sections)
+        - Context provider / context_items
+        - --slot-context / long context
+        - SYCL engine (build, kernels, layer split)
+        - Docs / benchmarks
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The request body (shorten long documents), the run config's engine args (remove paths you do not want public), and the commit (`git rev-parse --short HEAD`).
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: System
+      description: GPUs and VRAM, driver / compute runtime, oneAPI or CUDA/HIP version, OS, model and quant.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and the response's task_parallel object
+      description: The `task_parallel` metadata from the response, and the relevant engine-log lines.
+      render: text

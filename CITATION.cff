@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use Strata Void, please cite it and the upstream Strata project it is built on."
+title: "Strata Void: task-parallel requests and long-context serving for Strata on Intel Arc"
+type: software
+version: 0.1.0
+date-released: "2026-10-07"
+license: MIT
+repository-code: "https://github.com/Jumbomuffin777/Strata-Void"
+authors:
+  - alias: Jumbomuffin777
+references:
+  - type: software
+    title: Strata
+    authors:
+      - alias: Niko1221
+      - name: "the Strata contributors"
+    repository-code: "https://github.com/Niko1221/Strata"
+    license: MIT

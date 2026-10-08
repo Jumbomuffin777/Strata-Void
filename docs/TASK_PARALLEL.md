@@ -97,7 +97,7 @@ prompt read is the one read of it - the same read an ordinary request would do -
 (`ckpt=`); every later step (subtasks, section writers, the synthesis) *restores* that state instead of reading the
 material again (a device-side copy, ~1 s per admission at 16K, measured `reused_tokens` = the whole prefix). Every
 step sees all of the material, so facts that span documents are never split apart. This needs slots that hold the
-whole material: on the tri-Arc deployment 4 slots at 32K (fp16), 3 at 64K (fp16) or 4 at 128K (8-bit KV) fit beside
+whole material: on the three-card Arc deployment (B70 + B65 + B60) 4 slots at 32K (fp16), 3 at 64K (fp16) or 4 at 128K (8-bit KV) fit beside
 every expert (see BATCHING.md).
 
 ```
@@ -262,7 +262,7 @@ also `--batch-groups G`); with one request at a time AUTO always answers normall
 
 ## Latency vs compute (v1 measurements, 4K context)
 
-Where the time goes (one request; medians over 10 decomposable tasks, tri-GPU deployment below):
+Where the time goes (one request; medians over 10 decomposable tasks, the three-GPU deployment below):
 
 | phase | 2 workers | 4 | 6 |
 |---|---:|---:|---:|
@@ -288,7 +288,7 @@ ordinary request with a short thinking budget (2,900) and fewer than one thinkin
 
 ## Benchmarks (v2: enough context, long documents)
 
-Measured on one deployment (tri-Arc: Arc Pro B70 + B65 + B60, Swift 1.5 Qwen3.8 Flash-Next IQ4_XS, MTP drafts,
+Measured on one deployment (three Intel GPUs: Arc Pro B70 + B65 + B60, Swift 1.5 Qwen3.8 Flash-Next IQ4_XS, MTP drafts,
 every expert in VRAM, `--prefill 2048`, the fast prefill dequant). Unlike v1 (4K context, where the ordinary
 request ran out of room), every configuration here gives the ordinary request **enough context**: 32K (fp16 KV,
 4 full-size slots, split 18,35) for the short tasks and 8K/16K documents, 64K (fp16, 3 slots) for 32K documents,
@@ -451,7 +451,8 @@ reporting `provider.error` - memory augments, it never blocks.
 
 Measured on one deployment; the numbers describe that deployment, not the feature in general.
 
-**Setup.** One model (a 35B-class MoE, IQ4_XS, MTP speculative decoding) split by layers over three GPUs, served by
+**Setup.** Swift 1.5 Qwen3.8 Flash-Next IQ4_XS with MTP speculative decoding (`--spec 4`), split by layers over
+the three Arc Pro GPUs (B70 + B65 + B60, `--layer-split 18,34`, every expert in VRAM), served by
 `serve/server.py` with the engine's batch slots (`--batch 6`, 3 pipelined groups), context 4096 tokens, greedy
 sampling, the server's default reasoning effort. One request alone decodes at ~38-48 tok/s; six concurrent requests
 reach ~113 tok/s aggregate on the engine (~72 end-to-end through the server). Every request was streamed; wall-clock
@@ -577,7 +578,7 @@ internal requests are ordinary requests to the same server process and model: no
 - A subtask's prompt read pauses the slots that are decoding (this engine reads one prompt at a time and does not
   interleave reads with decoding). With a shared document the admissions are restores (~1-2 s each), so this costs
   little; with partitioned material it is part of why partitioning did not pay.
-- Full-size slots cost VRAM: on the tri-Arc deployment 4 at 32K, 3 at 64K, 4 at 128K (8-bit KV) fit beside every
+- Full-size slots cost VRAM: on the three-card Arc deployment (B70 + B65 + B60) 4 at 32K, 3 at 64K, 4 at 128K (8-bit KV) fit beside every
   expert; `--slot-context` trades slot size for more slots.
 - More compute per request (reported in every response); on a busy server AUTO uses only the free slots and
   answers normally when fewer than two are free.

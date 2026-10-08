@@ -1,211 +1,268 @@
-<h1 align="center">Strata</h1>
+<h1 align="center">Strata Void</h1>
 
-**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+<p align="center"><b>An experimental fork of <a href="https://github.com/Niko1221/Strata">Strata</a> for Intel Arc (SYCL):
+one request's work spread over the engine's concurrent batch slots, long-context serving up to 128K, a long
+document read once and shared by every step, and an optional retrieval hook.</b></p>
 
-<p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
-NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
+<p align="center">Upstream engine: <a href="https://github.com/Niko1221/Strata">Niko1221/Strata</a> (MIT) ·
+this fork: Task-Parallel Requests, <code>--slot-context</code>, faster prompt reading on Arc ·
+measured on 3 Intel Arc Pro GPUs (88 GB)</p>
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+---
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
-large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
-and coding agents. Nothing leaves your PC.
+> **What this is not.** Task-Parallel Requests do **not** make a single token stream faster. The answer you watch
+> being written still streams at the normal rate of one request (~40-45 tok/s on the hardware below). What gets
+> shorter is the **end-to-end time until one complex answer is complete**: the engine's otherwise idle concurrent
+> slots work on different parts of the same request at the same time.
 
-## How fast is it?
+## What is in this fork
 
-We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
+| | What it does | Measured (details: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)) |
+|---|---|---|
+| **Task-Parallel Requests** | One request → a planner → 2-6 internal requests in the engine's batch slots at once → one answer | complex requests answered **2-3× sooner** (median 181 s → 68 s), blind-graded at least as good |
+| **Fast prompt-path dequant** (SYCL) | New IQ4_XS / IQ4_NL → FP16 kernels for the prompt path; bit-identical output | prompt reading **~2×**: 334 → 659 tok/s at 16K; 600-630 tok/s out to 122K tokens |
+| **`--slot-context N`** | Batch slots can be smaller than the main context | contexts up to **128K** with batch slots (6 full-size slots stopped at 16K here) |
+| **Shared-context reuse** | A long document is read once (by the planner); every later step restores that state instead of re-reading it | 120K-token document: each step admitted in ~1.5-2 s instead of ~200 s |
+| **Retrieval hook** (optional) | A generic `ContextProvider`: one retrieval per request, provenance kept, fails open | 0-4 ms per request in the test; requests still answer if the provider is down |
 
-- **Writes answers:** how fast the reply appears in a short chat. 60 tokens per second is faster than you can read.
-- **Reads your prompt:** how fast it takes in what you send (here a 32K-token document, code or chat history).
+Everything else is upstream Strata: the engine, the OpenAI/Anthropic-compatible server, the CUDA/HIP builds, setup.
+The upstream README (with translations) is kept as [README.strata.md](README.strata.md).
 
-<table>
-<tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
-<tr><td>
+## Task-Parallel Requests in one picture
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
-
-</td><td>
-
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
-
-</td></tr>
-</table>
-
-NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K prompts). The full tables are in
-[DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
-about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
-[community results](docs/COMMUNITY_BENCHMARKS.md).
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
-
-## What you need
-
-| | |
-| --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series. It needs **12 GB of VRAM or more**. |
-| **RAM** | 32 GB or more. Your RAM decides [which model](#which-model-should-i-pick) fits. 64 GB runs every size. |
-| **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
-
-The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
-
-Experimental, written and tested by community members on their own machines:
-
-- **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
-- **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
-- **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
-
-The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
-
-## Install
-
-### Let your AI set it up
-
-Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
-
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+```mermaid
+flowchart TD
+    A["one request (task_parallel: auto | 2..8)"] --> G{"AUTO gate<br/>(no model call)"}
+    G -- "trivial / short" --> O["ordinary request<br/>(unchanged path)"]
+    G -- "decomposable" --> P["planner<br/>reads the request (and a long document) once;<br/>the engine checkpoints that prefix"]
+    P --> W1["subtask 1"]
+    P --> W2["subtask 2"]
+    P --> W3["subtask N"]
+    W1 & W2 & W3 --> S["synthesis: one answer from the notes<br/>(or sections written in parallel)"]
+    S --> R["ONE streamed answer"]
+    subgraph slots ["the engine's batch slots (same model, same process)"]
+        W1
+        W2
+        W3
+    end
 ```
 
-It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
-you how to connect your apps. AI tools can also install, start and stop Strata through its
-[MCP server](docs/MCP_SERVER.md).
+- The subtasks are ordinary internal requests running **concurrently in the engine's batch slots** (`--batch N`):
+  no extra model instance, no extra VRAM per request. Each one restores the shared prefix (the request, and a long
+  document if there is one) from the engine's checkpoint instead of reading it again.
+- Workers hand over **work products** (findings, figures, code), never their reasoning. Only the final answer
+  reaches the client.
+- It always costs **more compute** than one request (plan + subtasks + synthesis). Every response says how much.
 
-### Or do it yourself
+Full design, API and every setting: [docs/TASK_PARALLEL.md](docs/TASK_PARALLEL.md) ·
+architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-**Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
+## Why you might want it
 
-The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
-asks you a few questions:
+You have a server that can decode several requests at once (here: six slots reach ~113 tok/s together while one
+request alone gets ~40), and one user asking for something that takes a long time: a design review, a comparison
+across several dimensions, a migration plan, a question over a long document. Instead of one stream thinking
+for minutes, the parts run side by side and one synthesis writes the answer.
 
-- which model and which size,
-- how much context (how much text the model keeps in mind),
-- whether it should read pictures.
+It does not help for: short questions, chat, a single chain of dependent reasoning, or tasks that need one
+careful pass over a very long document (AUTO answers those normally; see [Limitations](#limitations)).
 
-Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
-download stops, run it again: it continues where it left off. Your browser opens the Strata app at
-`http://127.0.0.1:8080`.
+## Benchmark highlights
 
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
-> Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
-> close the window. The window shows what Strata is doing.
+Hardware for every number on this page (one machine, Intel GPUs only):
 
-**Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
-its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
-several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 9950X (16C/32T) |
+| Board / RAM | ASUS ProArt B850-CREATOR WIFI NEO · 64 GB DDR5 (4×16 GB, 4800 MT/s) |
+| OS | Ubuntu Server 26.04 LTS (26.04.1, kernel 7.0), oneAPI DPC++ 2026.1, Intel compute runtime 26.31 |
+| GPUs | Intel Arc Pro **B70** 32 GB + Arc Pro **B65** 32 GB (Battlemage G31) + Arc Pro **B60** 24 GB (G21) = **88 GB** |
+| Model | [Swift 1.5 Qwen3.8 Flash-Next](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF) (MoE), **IQ4_XS** (~4-bit, 3 GGUF shards), MTP draft head, `--spec 4` |
+| Placement | layer split across the three cards, **every expert in VRAM** (60.93 GiB of expert weights; no RAM spill) |
 
-## Which model should I pick?
+No NVIDIA GPU was involved in any result here.
 
-The installer recommends one for your RAM. The same model comes in several sizes, compressed more or less. Smaller
-sizes are faster. Larger sizes are a bit smarter.
+**Complex requests** (10 tasks: code review, system design, finance, research, contract review, migration plan;
+32K context so the ordinary request has room to finish; every run cold; wall-clock to the end of the answer):
 
-| Your RAM | Take | Why |
-| --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's UD-IQ4_XS (~4-bit) | room for the largest sizes with everything else open |
+| | ordinary request | notes + synthesis (4 subtasks) | sections only (4) | **AUTO** (final) |
+|---|---:|---:|---:|---:|
+| median wall-clock | 181 s | **68 s** | 41 s | 78 s |
+| geometric mean vs ordinary | 1.00 | **0.37** | 0.23 | **0.50** (0.29 on the 7 it split) |
+| blind quality, overall /10 | 7.1 (6.4 with a second grader) | **8.0** | 6.7 | **8.1** |
+| answers cut off / empty / looping | 2-3 of 7 | 0 of 7 | 1 of 7 | 0 of 7 |
 
-- **[Coder](docs/MODELS.md#coder):** a coding version with half of the experts removed. It reaches 91% of the full
-  model's SWE-bench Verified score (measured by its authors) and fits 32 GB of RAM. It is weaker outside code,
-  including Chinese and other CJK text (#438). For those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
-- **[Swift 1.5](docs/MODELS.md#swift-15):** a fine-tune that thinks for a much shorter time before it answers. You
-  get the answer sooner, at about the same quality.
-- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs):** Unsloth's ~4-bit version, between IQ3_S and
-  UD-Q4_K_XL in quality. A 94 GB download. With less than ~80 GB of RAM, Strata reads part of it from the SSD
-  while it answers, so it is slower there (an NVMe SSD helps).
-- **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental): the closest to the full
-  model. But Strata reads most of it from the SSD while it answers, so it writes only 7-8.5 tokens/s on a 64 GB PC.
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
-  not in the installer's menu.
+- "Sections only" was the fastest form but its independently written sections contradicted each other: it is
+  **not** what AUTO uses for such requests.
+- AUTO answered 3 of the 10 normally (the planner rated them "low" effort or found no independent parts) and sent
+  **12 of 12 trivial requests** straight to the ordinary path without calling the planner.
+- The answer's own visible decode rate stayed ~40-45 tok/s in every mode.
 
-Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
-`SETUP.bat` (Linux: `./setup.sh --setup`).
+**Long documents** (8K-120K tokens, seeded tasks with known answers): reading dominates (~200 s at 120K, the
+same in every mode). After the read, task-parallel steps pay when one request would think at length
+(contracts-120k: 244-262 s vs 439 s, or no answer at all in 2 of 3 runs, for the ordinary request) and do not pay
+for quick lookups. Sections written without thinking lose figures on long aggregations at 64K+, so AUTO answers
+hard long-document questions in one stream. Tables: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-## Using it
+## Hardware and software
 
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
+- **Tested:** the three-card Intel Arc Pro system above, Linux, the SYCL engine (`sycl/`), Swift 1.5 Flash-Next
+  IQ4_XS with every expert in VRAM.
+- **Should work, not measured here:** other Arc cards supported by upstream's SYCL port (B580/B570, B50, A-series
+  are listed in [docs/INTEL_ARC.md](docs/INTEL_ARC.md)); fewer cards with a smaller model or quant.
+- **Task-Parallel Requests themselves are engine-agnostic** (`serve/task_parallel.py` only issues ordinary
+  requests): they work with upstream Strata's CUDA/HIP engines and their batch slots too, but every number in this
+  repository was measured on Intel Arc. The `ckpt=` shared-prefix hint and `--slot-context` are implemented in the
+  SYCL engine in this fork.
+- No model weights are in this repository. You download the model yourself from its Hugging Face page and accept
+  its license there (the Swift Open License 1.0 for Swift 1.5; read it, and the base model's terms, before use).
 
-- **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
-  GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
-  **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
-  - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
-  - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
-    ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
-- **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
-  fastest. High is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
-  AMD cards read pictures on Linux through the processor; on Windows they can't yet.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,
-  set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
-- **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up
-  messages start in seconds.
+## Build (Linux, Intel Arc)
 
-More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
+Prerequisites (details in [docs/INTEL_ARC.md](docs/INTEL_ARC.md)): Intel's GPU driver and Level Zero runtime,
+Intel oneAPI DPC++ 2025.3+ with oneMKL, `cmake` 3.24+, `ninja`, `git`, Python 3.10+, and `intel-ocloc` for an
+ahead-of-time build.
 
-## Something went wrong?
+```sh
+git clone https://github.com/Jumbomuffin777/Strata-Void.git && cd Strata-Void
+source /opt/intel/oneapi/setvars.sh
+# AOT for both Battlemage classes in one binary (B70/B65 = bmg-g31, B60/B580 = bmg-g21); omit for a JIT build
+cmake -S sycl -B build-sycl -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+      -DSTRATA_SYCL_AOT="bmg-g21,bmg-g31"
+cmake --build build-sycl --target strata
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+```
 
-- **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the
-  window. Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again. It continues where
-  it stopped.
-- **It's very slow and the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does
-  not have enough free RAM. Close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
-- **It says port 8080 is already in use.** Strata is already running. Look for its window.
+### Model files
 
-More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder. Found a
-security problem? Report it privately: [SECURITY.md](SECURITY.md).
+Upstream's `setup.sh` downloads the models it knows (it offers Swift 1.5 as IQ2_XS); the IQ4_XS build measured here is
+prepared with upstream's own tools. About 100 GB of disk for the shards, ~5 GB for the draft head:
 
-## How does it work?
+```sh
+# 0. llama.cpp's gguf-py at the commit upstream's setup pins (iq_pack.py and mtp_pack.py read GGUFs with it)
+curl -L -o llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/3cf03257f219afbe7334045ff7c6a06ac68c627d.zip
+python3 -m zipfile -e llama.cpp.zip third_party/ && rm llama.cpp.zip
+mv third_party/llama.cpp-3cf03257f219afbe7334045ff7c6a06ac68c627d third_party/llama.cpp
+# 1. the three IQ4_XS shards (accept the model's license on its page first)
+.venv/bin/pip install huggingface_hub
+.venv/bin/hf download ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF --include "IQ4_XS/*" --local-dir models/swift15
+# 2. a Strata pack: the dense/shared tensors in the engine's form (the experts stay in the GGUF)
+.venv/bin/python tools/iq_pack.py --gguf models/swift15/IQ4_XS/Swift-1.5-Qwen3.8-Flash-Next-IQ4_XS-00001-of-00003.gguf \
+    --out models/swift15-iq4xs-pack --compat-bf16
+# 3. the MTP draft head (fetched from the base Qwen3.8-Flash-Next checkpoint by HTTP range requests, then packed)
+.venv/bin/python tools/mtp_fetch.py fetch --out models/mtp
+.venv/bin/python tools/mtp_pack.py --src models/mtp --experts q2_0 --out models/mtp/mtp-q2_0.gguf
+.venv/bin/python tools/mtp_rt.py --gguf models/mtp/mtp-q2_0.gguf --out models/mtp-rt
+cp data/draft_vocab_en.bin models/mtp-rt/draft_vocab.bin   # the English draft vocabulary every measurement used
+```
 
-Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes the model fit by **sharing the work across your whole PC**. Think of a kitchen: the things
-you use all the time stay on the counter, and the rest waits in the pantry.
+`STRATA_GGUF_PY=<path to gguf-py>` works instead of step 0. The expert profile is in the repository
+(`data/expert-profile.bin`). Engine flags and the SYCL environment variables are explained in upstream's
+[docs/INTEL.md](docs/INTEL.md).
 
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
+## Run
 
-- **The model is a team of 24,576 small specialists ("experts").** Each word needs only 10 of them.
-- **Your graphics card** keeps the few thousand experts that are used most often. **Your RAM** holds all of them,
-  and **your processor** works on the rest at the same time. **Your SSD** holds a big lookup table.
+The server takes a run config (JSON). [examples/](examples/) has the three configurations used for the
+benchmarks (32K / 64K / 128K); replace the `/path/to/...` placeholders with your files:
 
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
+```sh
+source /opt/intel/oneapi/setvars.sh   # the engine needs oneAPI's runtime libraries (SYCL, oneMKL)
+.venv/bin/python -m serve.server --engine strata --config examples/strata-void-32k.json --port 8095
+```
 
-- **Guess, then check:** a small helper guesses the next few words. The big model checks them all at once. You get
-  the same answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens at a time), at over 1,000 tokens per second.
+Check it: `curl -s http://127.0.0.1:8095/health` answers `"loaded": true` once the experts are in VRAM.
 
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
-[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
+## Use Task-Parallel Requests
 
-## Credits and license
+It is **off unless asked for**: per request with `"task_parallel"`, or as a server default in the run config.
 
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
-compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5)
-and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
-parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
+```sh
+curl -s http://127.0.0.1:8095/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "strata",
+  "messages": [{"role": "user", "content": "Design the backend of a ride-hailing dispatch system for a city with up to 100,000 concurrent drivers and 20,000 ride requests per minute at peak. Cover: (1) the data model, (2) real-time driver location ingestion, (3) the rider-driver matching algorithm, (4) how it scales and where the bottlenecks are, (5) failure handling and consistency (no double-assigned drivers), and (6) the main trade-offs you made."}],
+  "task_parallel": "auto",
+  "stream": true
+}'
+```
 
-## Support Strata
+(This is the `arch-dispatch` task of the benchmark: AUTO split it into 4 subtasks there. A one-line version of the same
+question is below AUTO's gate - under 160 characters counts as short - and is answered as an ordinary request.)
 
-Strata is free and open source. If it is useful to you, you can support its development:
+| `"task_parallel"` | behavior |
+|---|---|
+| absent, `null`, `false`, `"off"`, `0`, `1` | the ordinary request, unchanged |
+| `"auto"` (or `true`) | a model-free gate first; if it passes, the planner chooses 1 (answer normally) or 2..`max_workers` |
+| `2` … `8` (e.g. `2`, `4`, `6`) | the planner is asked for exactly that many subtasks (capped by the engine's slots) |
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+Optional request fields: `"task_parallel_compose"`: `"synthesis"` | `"sections"` | `"direct"` | `"auto"` (how the
+answer is written), `"context_items"`: `[{"text": "...", "title": "...", "source": "...", "kind": "document"}]`
+(material sent with the request), `"task_parallel_diagnostics": true` (adds the subtasks' objectives to the response
+metadata). Server default in the run config:
+
+```json
+"task_parallel": {"default": "auto", "max_workers": 4}
+```
+
+Every task-parallel response carries a `task_parallel` object: the decision and why, planning/subtask/synthesis
+times, tokens generated by every step, the subtasks' aggregate rate, coverage of a long document. Streamed
+responses send progress as SSE comments (`: task_parallel planning`), which standard clients ignore.
+
+### How AUTO decides
+
+1. **Gate** (no model call): short/simple/chat requests go straight to the ordinary path (12/12 in the test).
+2. **Load**: only slots other requests are not using count; fewer than two free → ordinary request.
+3. **Planner** (greedy, no thinking) returns strict JSON: an effort rating and 1..N subtasks. Unusable JSON gets one
+   retry with the error; a "low" effort or no independent parts → ordinary request.
+4. **Without a long document:** subtasks write notes, one synthesis writes the answer.
+5. **With a long document kept in the shared prefix:** a lookup ("low") gets its sections written in parallel; a
+   "medium"/"high" request is answered by **one stream that restores what the planner already read** (the quality
+   of an ordinary request, without reading the document twice).
+6. **A document larger than a batch slot** is cut into chunks at its own structure and the subtasks read slices.
+
+## Limitations
+
+Read these before quoting any number from this repository.
+
+- **Visible generation is unchanged** (~40-45 tok/s here). This is lower end-to-end latency for decomposable work,
+  not faster tokens. It is not "120 tok/s single-stream".
+- **It helps decomposable work, not every prompt.** Short answers, chat and one chain of dependent reasoning are
+  faster without it; AUTO tries to send those down the ordinary path and does not always get it right.
+- **Reading a long document is not parallelized.** The engine reads one prompt at a time; at 120K every mode pays
+  the same ~200 s before any answer.
+- **Parallel slots decode without MTP drafts** (~20-30 tok/s per slot vs ~45 alone), so splitting long careful
+  *reasoning* across slots is not faster. Sections written without thinking can disagree with each other and miss
+  figures in long aggregations (totals over dozens of items).
+- **Single-stream speculative settings** other than the one used (`--spec 4 --spec-min-p 0.5`) did not help:
+  `--spec-min-p` 0.3 / 0.7 gave the same text at the same speed; `--spec 5` / `6` were slower and changed the
+  output (on some prompts the model answered as if the prompt were garbled); `--spec 3` did not start with this
+  configuration. Treat values above 4 as unsupported on this build.
+- **Statistics:** the long-document headline cells were repeated 3 times (cold); the 10-task short-request table and
+  most other cells ran once per task and mode. One machine, one model, one LLM grader per grading pass (blind,
+  answers shuffled). No claim of a universal 2-3× speedup.
+- **VRAM:** full-size slots for a shared document fit 4 × 32K (fp16 KV), 3 × 64K (fp16) or 4 × 128K (8-bit KV) on
+  this 88 GB system beside every expert; `--slot-context` trades slot size for slot count.
+- **Feature off = upstream behavior:** with `task_parallel` absent the server's output matched the previous build
+  byte-for-byte on the regression set (6 solo + 6 concurrent requests, a cancelled stream, a follow-up), and the
+  new dequant kernels produced identical engine tokens.
+- Chat completions only (no tools, structured output or images on the task-parallel path); Linux only for the SYCL
+  engine; experimental software.
+
+## Reproduce the benchmarks
+
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) lists every configuration (context, KV format, slots, `--slot-context`,
+layer split) per table, the task sets ([bench/](bench/), [tools/longctx_tasks.py](tools/longctx_tasks.py)), the
+runner ([tools/task_parallel_bench.py](tools/task_parallel_bench.py)) and the scorer
+([tools/task_parallel_score.py](tools/task_parallel_score.py)). The raw results (every answer with its metadata,
+the blind-grading sheets and keys) are attached to the [v0.1.0 release](https://github.com/Jumbomuffin777/Strata-Void/releases/tag/void-v0.1.0).
+
+## Credits
+
+- **Strata** (engine, server, setup, the SYCL port) is the work of **Niko1221 and the Strata contributors**
+  ([upstream](https://github.com/Niko1221/Strata)); the SYCL port was started by maxfridbe (#423).
+- **Task-Parallel Requests**, the Strata Void direction and the Zability test system: **Jumbomuffin777**.
+  Implementation, debugging and benchmarking were AI-assisted (Claude) under his direction.
+- Running several sub-requests for one task is a known idea (parallel decoding, map-reduce over documents, agent
+  orchestration); this repository is an independently designed serving extension for Strata, not a claim to have
+  invented parallel LLM reasoning.
+
+See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md). License: MIT ([LICENSE](LICENSE)), as upstream.

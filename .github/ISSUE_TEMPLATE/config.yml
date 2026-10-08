@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Upstream Strata issues (engine, setup, CUDA/HIP)
+    url: https://github.com/Niko1221/Strata/issues
+    about: Problems that also happen without this fork's changes belong upstream.
