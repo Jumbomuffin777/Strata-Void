@@ -30,6 +30,7 @@ With a layer split, the engine options go into the config's `args`:
 | --- | --- |
 | `"parallel": N` / `--batch N` / `--slots N` (2..8) | up to N conversations decoded together; more requests wait for a free slot. Each slot gets its own state (a session carved like the stage's own: GDN recurrence, QSA K/V and indexer, PLE history) on every GPU of the split. |
 | `--batch-groups G` | with a layer split: the N slots in G groups that flow through the GPUs as a pipeline (GPU k runs one group while GPU k+1 runs another). G must divide N. 1 = all slots in one window, GPU after GPU. |
+| `--slot-context N` | (SYCL engine) the slots' own context, when smaller than `--max-context` (0 or more: the same). Slot sessions are sized for N cells on every GPU, so a long context for one request and several shorter slots fit together: e.g. `--max-context 131072 --batch 6 --slot-context 16384`. The engine reports it (`INFO slot_ctx=N`); a request whose prompt + `max_tokens` does not fit a slot runs on the solo path once the slots are empty (it is not moved to a slot when others arrive); shorter requests share the slots as usual. |
 | `--trim-stage-weights` | with an **explicit** `--layer-split` (e.g. `12,24,36`, not `auto`): every GPU loads only the dense weights of its own layers instead of the whole model's (the same as `STRATA_STAGE_TRIM=1`, PR #639). The VRAM this frees goes to the expert cache. Useful without `--batch` too. |
 
 The engine never refuses a count it cannot run: it says so in its log and runs what it can - at most 8 slots (a
@@ -37,6 +38,28 @@ window holds 8 rows), as many as fit in VRAM, or none (one request at a time) wh
 the count the engine reports (`INFO batch_slots=N`), and `GET /v1/status` says it (`concurrency.serving`).
 
 ### What a slot costs, and what setup recommends
+
+**`--slot-context`, measured** (SYCL, three Arc Pro cards B70 + B65 + B60, Swift 1.5 IQ4_XS, every expert in VRAM,
+`--batch 6 --batch-groups 3`, `--prefill 2048`). With full-size slots, 32K and longer contexts did not start (six
+32K-cell sessions on every GPU leave the B60 short of room for its experts). With `--slot-context 16384` (0.12-0.19
+GiB per slot per GPU):
+
+| context | KV | layer split | starts | one request: prompt read | decode |
+|---|---|---|---|---|---|
+| 32K | fp16 | 18,34 | no (17 experts short on the B60) | | |
+| 32K | fp16 | 18,35 | yes | 675 tok/s at 31K tokens | 38 tok/s |
+| 64K | fp16 | 18,35 | yes | 665 tok/s at 60K | 34 tok/s |
+| 64K | 8-bit | 18,34 | yes | 652 tok/s at 60K | 32 tok/s |
+| 128K | 8-bit | 18,34 | no (38 experts short) | | |
+| 128K | 8-bit | 18,36 | yes | 626 tok/s at 122K (197 s) | 34 tok/s |
+| 128K | fp16 | 18,36 | yes | 631 tok/s at 122K (193 s) | 34 tok/s |
+
+Full-size slots (each slot holds the whole context: what task-parallel requests need to share a long document
+between their steps, see TASK_PARALLEL.md) fit with fewer slots: 4 at 32K fp16 (18,35), 3 at 64K fp16 (18,35; 4 do
+not fit), 4 at 128K 8-bit (18,36; 3 at 128K fp16 do not fit).
+
+Moving the B65/B60 boundary (34 -> 35/36) moves layers between two cards whose kernels give bit-identical results;
+the B70 boundary (18) stays.  Prompt reading does not slow with length here (hybrid linear / sparse attention).
 
 Every slot's session takes VRAM that the expert cache would otherwise hold: 0.56 GiB at a 32K context with 8-bit
 KV, more with a longer context unless the KV cache streams (`--kv-resident`: then only the attention's 32K window

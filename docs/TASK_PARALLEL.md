@@ -57,6 +57,11 @@ AUTO is conservative and transparent; every decision is reported (`decision`):
 3. **Effort rule.** If the planner rates the request at an effort in `auto_skip_effort` (default `"low"`), AUTO
    answers normally: subtasks + synthesis only pay off when one request would otherwise think for a long time (see
    the break-even below).
+4. **Load (v2).** AUTO counts only the batch slots other requests are not holding; with fewer than two free it
+   answers normally (no planner call).
+5. **Large documents (v2).** A document kept whole in the shared prefix: the planner reads it (the one read); a
+   "low"-effort request gets its sections written in parallel, a "medium"/"high" one is answered by one stream that
+   restores the planner's read. A document larger than a slot: sliced, see below.
 
 ## How a request flows
 
@@ -80,6 +85,103 @@ AUTO is conservative and transparent; every decision is reported (`decision`):
    keep caveats, cover what is missing, and answer directly without mentioning the process. Its output is the
    response, streamed like any answer (thinking capped at `synthesis_reasoning` unless the request sets
    `reasoning_budget_tokens`; none if the request disabled thinking).
+
+## Large context (v2)
+
+A request can bring much more material than a short prompt: a long document pasted into the message (or the system
+prompt), documents sent with it (`"context_items": [{"text", "title", "source", "kind", "authority", "as_of",
+"pinned"}, ...]`) and what a retrieval provider returns. There are two regimes, chosen per request:
+
+**1. Shared (the material fits one batch slot).** The material stays whole in the shared prefix. The planner's
+prompt read is the one read of it - the same read an ordinary request would do - and the engine checkpoints there
+(`ckpt=`); every later step (subtasks, section writers, the synthesis) *restores* that state instead of reading the
+material again (a device-side copy, ~1 s per admission at 16K, measured `reused_tokens` = the whole prefix). Every
+step sees all of the material, so facts that span documents are never split apart. This needs slots that hold the
+whole material: on the tri-Arc deployment 4 slots at 32K (fp16), 3 at 64K (fp16) or 4 at 128K (8-bit KV) fit beside
+every expert (see BATCHING.md).
+
+```
+request + material ──► planner (reads it all once; checkpoint at the end of the shared prefix)
+                          │
+                          ├─► step 1: restore (copy) + its own ~100 tokens ─┐
+                          ├─► step 2: restore (copy) + its own ~100 tokens ─┼─► answer
+                          └─► step N: restore (copy) + its own ~100 tokens ─┘
+```
+
+**2. Partitioned (larger than a slot holds, `share_context`).** The material is cut into chunks at its own
+structure - whole top-level documents (a contract, a report, a file) where they fit a chunk - and the planner reads
+an index of them, never the material:
+
+```
+material ──► chunks (whole documents where they fit; ~chunk_tokens each)
+             ├─► INDEX: one line per chunk (id, title, first words)  ──► the planner reads only this + the request
+             ├─► pinned items (pinned, live state, a few durable memories) ──► every step
+             └─► the chunks, assigned: named "sources" of a subtask first, then every unnamed chunk to the subtask
+                 it fits best (BM25), or an even split in reading order ("shard": the same question over every part)
+```
+
+- Strategies: `partition` (distinct parts), `independent` (angles on the whole), `shard` (one objective, the
+  material split evenly, every part read once). When the planner sees no independent parts (or its plan is
+  unusable) and the material is partitioned, the request is sharded anyway: one ordinary request would have to read
+  all of it and think over all of it.
+- A subtask reads only its own chunks, at most `worker_source_tokens` and never more than one batch slot holds
+  (`--slot-context`), so it runs beside the others; a shard reports every relevant fact of its part (with chunk
+  ids) and gets an output budget of about a fifth of what it reads. The response reports coverage (`sources`).
+- **Facts that span partitions** are combined by the synthesis from the notes - a total over all contracts, a
+  maximum over all units, a value one component defines in terms of another's parameter.
+- **One bounded follow-up round**: a subtask that needs something outside its chunks writes `NEED: <what>` (at most
+  `need_per_worker`, `need_total` in all); each is answered once from the best-matching chunks (BM25, at most
+  `need_tokens`) by one more internal request. Never recursive: no follow-up of a follow-up, no second plan.
+- Partitioning does **not** make the material faster to read: the engine reads one prompt at a time, so N slices
+  cost what the whole costs (a little more), and a slot that is decoding pauses while another subtask's prompt is
+  read. Measured, it pays only when one request would think at length over the whole material.
+
+AUTO counts large material as a strong signal (+3 at the gate), uses only the slots other requests are not holding,
+caps subtasks so no slice is thinner than `min_shard_tokens`, and for partitioned material compares its cost model's
+estimate for one request against the parallel plan (`estimate` in the response).
+
+## Memory and retrieval (v2)
+
+`serve/context_pool.py` defines a small provider interface; nothing in it is specific to one memory system:
+
+```python
+class ContextProvider(Protocol):
+    def retrieve(self, query: str, k: int, budget_tokens: int) -> list: ...   # items, never instructions
+```
+
+and `HttpContextProvider` adapts any JSON endpoint (`POST {"query", "k", "budget_tokens"}` -> `{"items": [...]}`),
+configured as `"task_parallel": {"context_provider": {"url": "...", "timeout_s": 5}}`.
+
+- **Retrieve once.** The provider is called once per parent request (with the request, or its head and tail when
+  long), never by subtasks: no recursion, no per-worker queries. Items are deduplicated (by content) and packed
+  into `provider_tokens`.
+- **Kinds and authority.** Every item keeps its `source` (provenance) and `authority`, shown in its header.
+  `memory` items are durable knowledge; `live` items are mutable state, always shown with their `as_of` time and
+  never treated as durable facts; `document` items are material. Live state and pinned items are one shared copy
+  every step sees (within `pinned_tokens`); the rest are assigned to subtasks like the material.
+- **Fail open.** A provider error or timeout is reported (`context.provider.error`) and the request goes on
+  without memory; memory augments a request, it never blocks one.
+
+## Writing the answer in parallel (v2)
+
+v1 wrote the answer with one synthesis call, which dominated long answers (45-70 % of the wall-clock). v2 has
+three ways to write it, and `auto` chooses between them (`compose`, server config or `"task_parallel_compose"` per request):
+
+| compose | stages after the plan | the answer |
+|---|---|---|
+| `synthesis` (v1) | subtasks write notes | one call writes it from the notes |
+| `sections` | subtasks write notes; an outline call designs the sections and a **fact ledger** (the figures every section must use) | the sections written at the same time, from the notes and the ledger (implemented and unit-tested; not benchmarked in this pass, so `auto` does not use it) |
+| `direct` | the planner designs the answer's sections; each subtask **writes its section** (no notes, no outline) | one parallel stage; at most two closing sections (an overall summary, the recommendation) are written after the others, from their text |
+| `auto` (default) | a large document kept whole in the shared prefix: `direct` (AUTO answers a medium/high-effort request there in one stream that restores the planner's read); otherwise notes + one synthesis | measured: see Benchmarks (v2) |
+
+Assembly is deterministic, not a rewrite: sections are streamed **in order as they are written** (section 1 as it
+is generated, each later one once the ones before it are out), every section starts with its heading, a paragraph
+that repeats an earlier one (3-word shingles, Jaccard >= 0.8) is dropped. The "editor" costs no model call. A
+section that fails is retried once, then left out (`sections_missing`). The outline (or, for `direct`, the plan's
+outline) is a second shared prefix: the engine reads it once and the writers restore it.
+
+Section writers decode side by side, so the answer's aggregate rate is the slots' rate (e.g. 4 writers x ~23 tok/s);
+each section's own stream is still one request's rate, and the client sees one ordered stream.
 
 ## Streaming
 
@@ -134,6 +236,21 @@ returned. `usage` is the synthesis' own (the answer the client received).
 | `gate_threshold` | 2 | AUTO's heuristic score needed before the planner is asked |
 | `auto_skip_effort` | "low" | planner effort ratings at which AUTO answers normally |
 | `internal_effort` | "low" | the template reasoning effort all internal requests are rendered with |
+| `partition_min_tokens` / `chunk_tokens` | 6000 / 1500 | material above this is partitioned (unless shared, below); target chunk size |
+| `share_context` | -1 | material up to this many tokens stays whole in the shared prefix (read once, restored by every step); -1: what one batch slot holds less 4,096; 0: off |
+| `worker_source_tokens` | 24000 | the most material one subtask reads (also bounded by a slot's context) |
+| `min_shard_tokens` | 2000 | AUTO: fewer subtasks rather than slices thinner than this |
+| `pinned_tokens` | 1500 | pinned items, live state and the top durable memories every step sees |
+| `need_per_worker` / `need_total` / `need_tokens` | 2 / 6 / 3000 | the one follow-up round |
+| `provider_k` / `provider_tokens` | 8 / 3000 | one retrieval per request |
+| `context_provider` | none | `{"url", "timeout_s", "headers"}`: a JSON retrieval endpoint |
+| `compose` | "auto" | how the answer is written: synthesis, sections, direct, auto |
+| `auto_shared_one_effort` | "medium,high" | AUTO with a large shared document: these planner ratings are answered in one stream |
+| `synthesis_max_tokens` | 12288 | the most the notes' synthesis writes when the request sets no `max_tokens` (0: no cap) |
+| `section_tokens_per_word` | 2.2 | a section's output budget per planned word |
+| `writer_reasoning` / `outline_tokens` / `outline_reasoning` | 0 / 500 / 192 | section writers' thinking; the outline's budgets |
+| `max_sections` / `section_min_words` / `compose_min_words` | 6 / 120 / 500 | section limits; "auto" writes sections only for an answer at least this long |
+| `prefill_tok_s` / `decode_tok_s` / `slot_tok_s` / `admission_s` | 600 / 38 / "2:30,3:26,4:23,6:19" / 0.9 | AUTO's cost model (this deployment's measured rates) |
 
 ## Engine requirements
 
@@ -143,7 +260,7 @@ engine builds. To gain wall-clock the engine must run requests concurrently (Str
 also `--batch-groups G`); with one request at a time AUTO always answers normally. The shared-prefix checkpoint
 (`ckpt=`, `INFO prefix_ckpt=1`) is an optimization; without it every internal request reads the shared context again.
 
-## Latency vs compute
+## Latency vs compute (v1 measurements, 4K context)
 
 Where the time goes (one request; medians over 10 decomposable tasks, tri-GPU deployment below):
 
@@ -169,7 +286,168 @@ subtask's own tokens past the shared prefix, the synthesis' notes) where one req
 slots busy for 15-20 s, and generates 2,300-3,100 tokens in all (plan + subtasks + answer) - about as many as one
 ordinary request with a short thinking budget (2,900) and fewer than one thinking at length (3,300-3,600).
 
-## Benchmarks
+## Benchmarks (v2: enough context, long documents)
+
+Measured on one deployment (tri-Arc: Arc Pro B70 + B65 + B60, Swift 1.5 Qwen3.8 Flash-Next IQ4_XS, MTP drafts,
+every expert in VRAM, `--prefill 2048`, the fast prefill dequant). Unlike v1 (4K context, where the ordinary
+request ran out of room), every configuration here gives the ordinary request **enough context**: 32K (fp16 KV,
+4 full-size slots, split 18,35) for the short tasks and 8K/16K documents, 64K (fp16, 3 slots) for 32K documents,
+128K (8-bit KV, 4 slots, split 18,36) for 64K and 120K documents. Within a row every mode ran on the same server.
+**Every run is cold**: the benchmark puts a unique first line in each request (`Run <id>.`), so no run reuses what an
+earlier one read (an earlier draft of this benchmark let the second mode over the same document skip reading it:
+those numbers are discarded). Greedy sampling, one run per cell unless marked ×n, wall-clock seconds from sending
+the request to the end of the answer.
+
+Modes: `off` = the ordinary request (default effort, thinks as long as it wants); `off+b4096` = the same with a
+4,096-token thinking budget; `N` = task-parallel with notes + one synthesis (`compose` "synthesis"); `N/direct` = the
+subtasks write the answer's sections (`compose` "direct"); `auto/auto` = AUTO with `compose` "auto" (AUTO's rules
+changed during this pass - see the end of this section).
+
+### Short complex requests (the v1 task set, now with a 32K context)
+
+Wall-clock s (automatic checks where the task has them; ¹ = AUTO answered with one request):
+
+| task | prompt tokens | off | off+b4096 | 4 | 4/direct | auto/auto |
+|---|---:|---:|---:|---:|---:|---:|
+| code-bugs | 387 | 108 (3/3) | 116 (3/3) | 46 (3/3) | 31 (3/3) | 31 (3/3) |
+| code-funcs | 204 | 39 (15/15) | 61 (15/15) | 52 (15/15) | 34 (15/15) | 49 (15/15)¹ |
+| arch-dispatch | 174 | 320 | 232 | 89 | 53 | 52 |
+| db-compare | 155 | 123 | 231 | 72 | 39 | 43 |
+| fin-npv | 282 | 348 (9/9) | 152 (8/9) | 66 (6/9) | 46 (6/9) | 44 (6/9) |
+| fin-quick | 210 | 70 (3/3) | 97 (3/3) | 48 (3/3) | 30 (2/3) | 71 (3/3)¹ |
+| research-2008 | 146 | 155 | 150 | 75 | 38 | 609¹ |
+| contract-review | 387 | 652 | 623 | 71 | 43 | 40 |
+| latency-hypotheses | 231 | 207 | 216 | 66 | 56 | 56 |
+| migration-plan | 149 | 319 | 414 | 83 | 45 | 44 |
+
+| | off | off+b4096 | 4 | 4/direct | auto/auto (as run) |
+|---|---:|---:|---:|---:|---:|
+| median wall-clock | 181 s | 184 s | 68 s | 41 s | 46 s |
+| geometric mean vs `off` | 1.00 | 1.06 | **0.37** | 0.23 | 0.34 |
+
+Blind grading (7 rubric / figure-checked tasks, answers shuffled under random ids, graded by an LLM grader that did
+not know the modes; scores 1-10):
+
+| | off | off+b4096 | 4 | 4/direct | auto/auto (as run) |
+|---|---:|---:|---:|---:|---:|
+| rubric coverage | 0.77 | 0.85 | **0.94** | 0.84 | 0.73 |
+| correctness | 7.4 | 7.0 | **7.6** | 6.7 | 5.7 |
+| completeness | 7.7 | 8.0 | **9.0** | 7.3 | 6.1 |
+| overall | 7.1 | 6.7 | **8.0** | 6.7 | 5.6 |
+| cut off / empty / looping | 2 of 7 | 2 of 7 | 0 of 7 | 1 of 7 | 2 of 7 |
+
+- **Notes + one synthesis (`4`) answered 2.7× sooner than the ordinary request (geometric mean) and was graded
+  best.** Even with a 32K context the ordinary request thinks for minutes on these prompts (8-16K tokens on four of
+  them; two ran into the context and gave no answer or looped).
+- Sections written directly (`4/direct`) were fastest (4.4×) but contradicted each other (two sections, two different
+  matching windows) and made arithmetic slips: graded below the ordinary request. Not used by AUTO without a large
+  document.
+- The figure-heavy NPV/IRR task was the exception: the ordinary request computed every figure right (9/9, after
+  5.8 minutes); every parallel form got the decision and NPVs right but some IRRs wrong (6/9).
+- `auto/auto` as run had two failures since fixed: a plan with 5 subtasks where 4 were allowed was rejected and the
+  request fell back to an ordinary request that thought until the context was full (now: one retry, told what was
+  wrong); and it then wrote sections directly (now: notes + synthesis).
+
+### Long documents: the scaling curve
+
+Seeded documents with known answers (`tools/longctx_tasks.py`): vendor contracts (which may be terminated on short
+notice, their total fees, which caps are below fees), business-unit reports (the total over every unit, the best
+margin, the units that fell), a configuration reference (a value one component defines from another's parameter).
+Score = expected names and figures found. Prompt tokens measured by the server.
+
+| task | prompt tokens | off | off+b4096 | 3 | 3/direct | auto/auto |
+|---|---:|---:|---:|---:|---:|---:|
+| contracts-8k | 7913 | 51 (6/6) | 39 (6/6) | 54 (6/6) | 37 (6/6) | 56 (6/6)¹ |
+| contracts-16k | 15733 | 60 (6/6) | 80 (6/6) | 68 (6/6) | 53 (4/6) | 52 (5/6) |
+| reports-8k | 8109 | 168 (5/5) | 106 (5/5) | 92 (4/5) | 43 (4/5) | 38 (4/5) |
+| reports-16k | 16079 | 296 (5/5) | 121 (3/5) | 155 (4/5) | 51 (4/5) | 48 (4/5) |
+| config-8k | 8136 | 121 (3/3) | 36 (3/3) | 54 (3/3) | 33 (3/3) | 60 (3/3)¹ |
+| config-16k | 16044 | 63 (3/3) | 59 (3/3) | 65 (3/3) | 48 (3/3) | 80 (3/3)¹ |
+| contracts-32k | 31951 | 128 (6/6) | 111 (6/6) | 92 (6/6) | 76 (6/6) | 181 (6/6)¹ |
+| contracts-64k | 63736 | 242 (6/6) | 194 (6/6) | 1154 (1/6) | 139 (1/6) | 149 (2/6) |
+| contracts-120k | 119639 | 439 (6/6) | 302 (6/6) | 244 (6/6) | 236 (2/6) | 253 (3/6) |
+| reports-64k | 63851 | 1467 (0/5) | 200 (3/5) | 283 (4/5) | 134 (1/5) | 134 (1/5) |
+| reports-120k | 119609 | 440 (0/5) | 302 (3/5) | 246 (3/5) | 224 (2/5) | 234 (1/5) |
+| config-64k | 63974 | 125 (3/3) | 143 (3/3) | 146 (3/3) | 126 (3/3) | 123 (3/3) |
+| config-120k | 120313 | 241 (3/3) | 251 (3/3) | 247 (3/3) | 232 (3/3) | 228 (3/3) |
+
+32K documents on the 64K server (later runs; "3" there already ran under `compose` "auto", i.e. as sections):
+reports-32k off 616 s (5/5, 26,885 tokens of thinking), off+b4096 139 s (3/5), 3 → sections 76 s (4/5), 3/direct
+76 s (3/5), final AUTO 604 s (5/5, one stream); config-32k 78 / 98 / 70 / 78 / 69 s, all 3/3.
+
+Repeats (3 cold runs each; the random first line changes how long the ordinary request thinks):
+
+| task | off | off+b4096 | notes + synthesis | sections (direct) |
+|---|---|---|---|---|
+| contracts-120k | 439 s 6/6; 441 s and 447 s **no answer** (thinking filled the context) | 302 / 294 / 306 s, 6/6 each | 244 / 247 / 262 s; 6, 5, 4 of 6 | |
+| contracts-8k | 51 / 50 / 41 s, 6/6 | | | 37 / 48 / 40 s; 6, 4, 4 of 6 |
+| config-8k | 121 / 53 / 32 s, 3/3 | | | 33 / 34 / 34 s, 3/3 |
+| config-16k | 63 / 75 / 126 s, 3/3 | | | 48 / 52 / 48 s, 3/3 |
+
+How the time is spent (the shared regime, every step restoring the planner's read):
+
+| | 8K | 16K | 32K | 64K | 120K |
+|---|---:|---:|---:|---:|---:|
+| planning: the one read of the document + the plan (~200 tokens) | 16 s | 28 s | 53 s | 104 s | 202 s |
+| prompt reading rate (ordinary request, to its first token) | 600-630 tok/s at every length | | | | |
+| each subtask's admission (restore, not re-read) | ~1 s | ~1 s | ~1.3 s | ~1.4 s | ~1.5-2 s |
+| subtasks (3, side by side) | ~20 s | ~20 s | ~17 s | ~21 s | ~22 s |
+| synthesis (notes; 192 thinking tokens) | ~18 s | ~18 s | ~22 s | ~18 s* | ~20 s |
+
+(* one 64K synthesis looped for 51,180 tokens: the synthesis is now capped at `synthesis_max_tokens`, 12,288.)
+
+What the curve shows:
+
+- **Reading dominates at length** and nothing parallel makes it faster: the engine reads one prompt at a time, so
+  every mode pays the same ~200 s at 120K. Task-parallel saves what comes after the read.
+- **Where the ordinary request thinks at length, parallel steps pay**: contracts-120k 439 s → 244 s at the same
+  score (6/6); the business-unit reports at 64K made the ordinary request think until the context was full (24
+  minutes, no answer), task-parallel answered in 134-283 s.
+- **Where it does not, they do not**: the configuration lookups are answered in one short pass by the ordinary
+  request (125 s at 64K); parallel steps add only their own overhead.
+- **Accuracy drops with length for parallel writers without thinking.** Totals over 38-570 units and "every
+  contract with a short notice" over 170 contracts need one careful pass: at 64K and 120K the directly written
+  sections missed figures (1-3 of 6) that the ordinary request found. Section writers with a thinking budget
+  (1,024 / 3,072 tokens; measured at 8-16K) recovered some accuracy but lost the speed: a batch slot decodes without
+  MTP drafts (~20-30 tok/s per slot against ~45 tok/s alone), so thinking in parallel slots is not faster than one
+  request thinking alone.
+- **Partitioning (slices of the document per subtask) did not pay** even before accuracy: N slices read one after
+  another cost what the whole costs, a slot that is decoding pauses while another slice is read, and the notes then
+  need a synthesis (measured with 6 slots of 16K over the 32K contracts: 147-201 s for 2-6 subtasks against 161 s for the ordinary
+  request on the same server; those runs predate the cold-run fix, so later modes may have reused a little). It remains for
+  material larger than a slot can hold.
+
+AUTO after this pass (`compose` "auto", the default):
+
+- without a large document: notes + one synthesis (the blind-graded best form above);
+- with a large document that fits a slot: the planner reads it once; a "low"-effort request (a lookup) gets its
+  sections written in parallel; a "medium"/"high" request is answered by **one stream that restores what the
+  planner read** (quality of the ordinary request, no second read);
+- trivial requests never reach the planner (12/12 here, 1.5-19 s).
+
+Measured again on the same tasks:
+
+| | short complex requests (10) | long documents |
+|---|---|---|
+| decision | notes + synthesis on the 7 it split; 3 answered as usual (planner: "low" effort or no independent parts) | lookups ("low"): sections; the rest: one stream over the planner's read |
+| wall-clock vs ordinary request | geometric mean **0.50** (0.29 on the 7 it split); median 78 s vs 181 s | contracts-8k 41 vs 45-51 s, config-16k 48 vs 63-126 s; contracts-16k 70 vs 60 s, reports-16k 300 vs 296 s, contracts-120k 427 vs 439 s, reports-120k 437 vs 440 s (both: no answer, the context filled) |
+| blind quality (7 rubric tasks; second grader, answers shuffled) | overall **8.1** (ordinary 6.4, notes + synthesis with 4: 8.0); 0 of 7 cut (ordinary: 3) | same scores as the ordinary request (one stream) or equal scores (lookups) |
+
+So AUTO is **faster on complex short requests at better graded quality**, faster on long-document lookups at equal
+scores, and **no faster on hard long-document requests**: there the remaining choice is the caller's - `3` (notes
++ one synthesis) answered contracts-120k in 244-262 s (6/6, 5/6, 4/6) where the ordinary request needed 439 s or
+gave no answer, and `off` with a thinking budget gave 6/6 in ~300 s.
+
+Memory (`context_provider` pointed at a stand-in JSON endpoint kept with the evidence, five items: a
+pinned policy, a supplier list, a live budget, an irrelevant note, a glossary; the request: the 32K contracts plus
+three questions only memory answers): one retrieval per request (0-4 ms, 5 items, 204 tokens); `3` (here: sections
+over the shared document, 89.6 s) and
+AUTO (132 s) used the policy, the list and the live budget correctly (7/7); the ordinary request without memory
+(172 s) missed the budget question (6/7). With the endpoint unreachable (a port in use: HTTP 404) every request still answered,
+reporting `provider.error` - memory augments, it never blocks.
+
+
+## Benchmarks (v1: 4K context)
 
 Measured on one deployment; the numbers describe that deployment, not the feature in general.
 
@@ -286,17 +564,21 @@ internal requests are ordinary requests to the same server process and model: no
 
 ## Limitations
 
-- The answer starts later (31-43 s here): a request that one ordinary request answers well with little thinking is
-  answered sooner without task-parallel. AUTO's gate and effort rule avoid most such requests, not all.
-- The final answer is written by one stream; on long-answer tasks the synthesis dominates (45-70 % of the
-  wall-clock). Splitting the writing itself (sections written in parallel after an outline) is not implemented.
-- Subtasks are admitted one after another (~0.9-1.1 s each here, while the running ones pause): the last of six
-  starts ~4.5 s after the first. Reading new prompts beside decoding slots would remove most of that (upstream
-  Strata has work in this direction); it is not part of this version.
-- The planner is the same model: its split can be uneven or miss parts; the synthesis is told to cover what is
-  missing, but cannot recover work no subtask did. Subtask budgets are fixed shares; about half the subtasks used
-  their whole budget.
-- More prompt processing and slot occupancy per request: on a busy server task-parallel requests compete with other
-  users' requests for the same slots (subtasks are capped at the engine's slot count; AUTO does not yet look at
-  the current load).
-- v1: chat completions without tools, structured output or images.
+- **It does not make reading faster.** The engine reads one prompt at a time; with a long document every mode
+  pays the same read (~200 s at 120K here). Task-parallel shortens what comes after it.
+- **Parallel steps decode without MTP drafts** (a batch slot emits one token per window: ~20-30 tok/s per slot
+  against ~45 tok/s for a request alone), so work that needs long careful reasoning is not faster split across
+  slots; and sections written without thinking lose accuracy on long aggregations (totals over dozens of items).
+  AUTO therefore answers medium/high-effort requests over a large document in one stream.
+- The answer starts later than an ordinary request's first token when that request would think briefly
+  (plan + subtasks + synthesis ≈ 40-70 s here); AUTO's gate and effort rule avoid most such requests, not all.
+- The planner is the same model: its split can be uneven or miss parts, and its effort rating decides AUTO's form.
+  An unusable plan is retried once with the error, then the request is answered as usual.
+- A subtask's prompt read pauses the slots that are decoding (this engine reads one prompt at a time and does not
+  interleave reads with decoding). With a shared document the admissions are restores (~1-2 s each), so this costs
+  little; with partitioned material it is part of why partitioning did not pay.
+- Full-size slots cost VRAM: on the tri-Arc deployment 4 at 32K, 3 at 64K, 4 at 128K (8-bit KV) fit beside every
+  expert; `--slot-context` trades slot size for more slots.
+- More compute per request (reported in every response); on a busy server AUTO uses only the free slots and
+  answers normally when fewer than two are free.
+- Chat completions without tools, structured output or images.
