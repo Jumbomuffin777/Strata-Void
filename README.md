@@ -255,6 +255,12 @@ runner ([tools/task_parallel_bench.py](tools/task_parallel_bench.py)) and the sc
 ([tools/task_parallel_score.py](tools/task_parallel_score.py)). The raw results (every answer with its metadata,
 the blind-grading sheets and keys) are attached to the [v0.1.0 release](https://github.com/Jumbomuffin777/Strata-Void/releases/tag/void-v0.1.0).
 
+## Support
+
+Strata Void is free and open source. If it has helped your local LLM setup and you'd like to support continued development, testing, and hardware costs:
+
+☕ [Buy Me a Coffee](https://buymeacoffee.com/jumbomuffin777)
+
 ## Credits
 
 - **Strata** (engine, server, setup, the SYCL port) is the work of **Niko1221 and the Strata contributors**
