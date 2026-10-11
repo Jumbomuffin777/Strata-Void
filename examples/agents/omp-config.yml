@@ -1,0 +1,20 @@
+# Keep local tool execution interactive. Approval is not OS containment.
+tools:
+  approvalMode: write
+  approval:
+    bash: prompt
+    eval: prompt
+    task: prompt
+    mcp__rea_analyze_javascript_application: prompt
+    mcp__rea_inspect_managed_artifact: prompt
+    mcp__rea_inspect_pe_resources: prompt
+    mcp__rea_inspect_evm_interface: prompt
+    mcp__rea_inspect_analysis_view: prompt
+    mcp__rea_get_evidence_bundle: prompt
+modelRoles:
+  default: strata/flash-next-iq3s
+  smol: strata/flash-next-iq3s
+  slow: strata/flash-next-iq3s
+  plan: strata/flash-next-iq3s
+  task: strata/flash-next-iq3s
+  commit: strata/flash-next-iq3s

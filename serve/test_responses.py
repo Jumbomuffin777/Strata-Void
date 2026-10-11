@@ -18,6 +18,7 @@ from serve.frontend import ChatTemplate  # noqa: E402
 from serve.responses import (ENCRYPTED_PREFIX, ResponsesError, input_messages, request_tools,  # noqa: E402
                              template_kwargs, text_format)
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
+from serve.structured import jsonschema_modules  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ChatTemplate(ROOT / "serve/chat_template.jinja")
@@ -275,7 +276,14 @@ class OverHttp(Server):
         code, events = self.post({"model": "m", "input": "a number", "text": {"format": fmt}, "stream": True})
         self.assertEqual([e["delta"] for e in events if e["type"] == "response.output_text.delta"], ["{\"n\":3}"])
         self.assertEqual(events[-1]["type"], "response.completed")
-        # an answer that fails the schema
+
+    @unittest.skipUnless(jsonschema_modules(), "jsonschema is not installed")
+    def test_json_schema_rejects_invalid_output(self):
+        self.engine.scripts = [self.tok.encode("</think>\n\n{\"n\": 3}<|im_end|>", parse_special=True)]
+        self.engine.script = self.engine.scripts[0]
+        fmt = {"type": "json_schema", "name": "num", "strict": True,
+               "schema": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}}
+        # Detailed schema validation is optional; keep the JSON-format test above dependency-free.
         bad = {**fmt, "schema": {**fmt["schema"], "properties": {"n": {"type": "string"}}}}
         code, r = self.post({"model": "m", "input": "a number", "text": {"format": bad}})
         self.assertEqual((code, r["error"]["code"]), (502, "structured_output_failed"))
@@ -331,6 +339,22 @@ class ToolRoundTrip(Server):
         self.assertTrue(second_prompt.startswith(first_prompt + CALL + "<|im_end|>"), second_prompt[-600:])
         self.assertIn("<tool_response>\nbefore\n</tool_response>", second_prompt)
         self.assertEqual(r["output"][-1]["content"][0]["text"], "The file says before.")
+
+    def test_namespace_call_written_with_double_underscore(self):
+        # Qwen writes Codex's MCP tools in their flat `mcp__server__tool` form; Codex only
+        # runs the call when it comes back with its namespace.
+        self.engine.scripts = [self.tok.encode(
+            "</think>\n\n<tool_call>\n<function=mcp__websearch__web_search>\n<parameter=query>\nstrata\n"
+            "</parameter>\n</function>\n</tool_call><|im_end|>", parse_special=True)]
+        self.engine.script = self.engine.scripts[0]
+        tools = [{"type": "namespace", "name": "mcp__websearch", "description": "Search.", "tools": [
+            {"type": "function", "name": "web_search",
+             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}]}]
+        code, r = self.post({"model": "m", "input": "go", "tools": tools})
+        self.assertEqual(code, 200, r)
+        call, = r["output"]
+        self.assertEqual((call["namespace"], call["name"], json.loads(call["arguments"])),
+                         ("mcp__websearch", "web_search", {"query": "strata"}))
 
     def test_namespace_and_custom_calls_come_back_under_their_own_names(self):
         self.engine.scripts = [self.tok.encode(

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "rea": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "/path/to/rea-runtime/node_modules/rea-agents/scripts/rea.mjs",
+        "mcp"
+      ],
+      "enabled": false,
+      "timeout": 60000,
+      "env": {
+        "REA_MCP_INPUT_SCHEMA_PROFILE": "compact"
+      }
+    }
+  }
+}

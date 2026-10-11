@@ -241,7 +241,9 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
     {"type": "function", "function": {"name": ...}} (`wrapper` "function"; a bare {"name": ...} is still taken), or
     in the Anthropic shape {"name": ...} (`wrapper` None).  A value that is not (a string such as "auto", a list of
     names, an object without a name) is a ValueError - a 400 naming the field - where it used to take the request
-    thread down with no reply at all.  No value (or an empty one) is no tools, as always."""
+    thread down with no reply at all.  No value (or an empty one) is no tools, as always.  A tool's schema -
+    "parameters" in the OpenAI shape, "input_schema" in the Anthropic one - is an object when it is there, for the
+    same reason: a string or a list passed and raised later instead, on the model's first call of that tool."""
     if not value:
         return []
     shape = ('{"type": "function", "function": {"name": ..., "parameters": {...}}}' if wrapper else
@@ -250,11 +252,35 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
         tools = _object_list(value, "tools")
     except ValueError:
         raise ValueError(f"tools must be a list of tool objects, each {shape}") from None
+    key = "parameters" if wrapper else "input_schema"
     for i, t in enumerate(tools):
         fn = t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t
         if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
             raise ValueError(f"tools[{i}] has no name: each tool must be {shape}")
+        schema = fn.get(key)
+        if schema is not None and not isinstance(schema, dict):
+            # it reached parse_tool_call and the stream parser as the tool's schema, whose .get("properties") raised
+            # AttributeError in the request thread - after the 200 and whatever the model had said before the call
+            raise ValueError(f'tools[{i}] ({fn["name"]}): "{key}" must be an object (the JSON schema of its '
+                             f"parameters), not {type(schema).__name__}")
     return tools
+
+
+def tool_arguments(raw) -> dict:
+    """A call's arguments from a client's history -> the mapping the template renders (both APIs).  A JSON object
+    (as text or already parsed) is used as it is; empty is {}; anything else (cut-off or malformed JSON, a list, a
+    number) is kept as text under "arguments" instead of refusing the whole conversation (#510)."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return {"arguments": raw}
+        return value if isinstance(value, dict) else {"arguments": raw}
+    return {"arguments": json.dumps(raw, ensure_ascii=False)}
 
 
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
@@ -273,10 +299,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 fn = c.get("function", c)
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
-                args = fn.get("arguments")
-                if isinstance(args, str):               # the template requires a mapping, not a JSON string
-                    args = json.loads(args) if args.strip() else {}
-                calls.append({"function": {"name": fn.get("name"), "arguments": args or {}}})
+                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))}})
             out["tool_calls"] = calls
         messages.append(out)
     tools = [t.get("function", t) if t.get("type") == "function" else t
@@ -311,19 +334,25 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
             messages.append({"role": "user", "content": _parts_of(content)})
             continue
-        text, reasoning, calls = [], [], []
+        text, reasoning, calls, parts = [], [], [], []
         for block in content or []:
             kind = block.get("type")
             if kind == "text":
                 text.append(block.get("text", ""))
+                parts.append(block)
+            elif kind in IMAGE_PARTS:
+                parts.append(block)
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": block.get("input") or {}}})
+                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
             elif kind == "tool_result":
-                messages.append({"role": "tool", "content": _text_of(block.get("content"))})
-        if text or calls or reasoning:
-            out = {"role": m["role"], "content": "".join(text)}
+                # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
+                # path's tool messages already do; a text-only result is one string, as before.
+                messages.append({"role": "tool", "content": _parts_of(block.get("content"))})
+        if text or calls or reasoning or parts:
+            # an image sent beside tool results stays in this turn instead of being dropped
+            out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
             if reasoning:
                 out["reasoning_content"] = "".join(reasoning)
             if calls:
@@ -374,6 +403,7 @@ CALL_END = "</tool_call>"
 
 
 PARAM_END = "</parameter>"
+FUNC_START = "<function="
 FUNC_END = "</function>"
 
 
@@ -428,6 +458,50 @@ def call_end(text: str) -> int:
             return text.find(CALL_END, pos)
 
 
+def tool_choice_of(tool_choice) -> tuple[str, str | None]:
+    """A client's `tool_choice` in either API's shape -> ("auto" | "none" | "required" | "named", name).  OpenAI:
+    "auto" / "none" / "required", {"type": "function", "function": {"name": N}} or the flat {"type": "function",
+    "name": N}; Anthropic: {"type": "auto" | "any" | "none"} and {"type": "tool", "name": N}.  A value it does not
+    know is ("unknown", None)."""
+    if tool_choice is None:
+        return "auto", None
+    if isinstance(tool_choice, str):
+        return (tool_choice, None) if tool_choice in ("auto", "none", "required") else ("unknown", None)
+    if isinstance(tool_choice, dict):
+        kind = tool_choice.get("type")
+        if kind in ("auto", "none"):
+            return kind, None
+        if kind in ("any", "required"):
+            return "required", None
+        if kind in ("function", "tool"):
+            fn = tool_choice.get("function")
+            name = (fn.get("name") if isinstance(fn, dict) else None) or tool_choice.get("name")
+            if isinstance(name, str) and name:
+                return "named", name
+    return "unknown", None
+
+
+def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
+    """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
+    There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
+    "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
+    unknown shape, a name that is not one of the tools, "required" with no tools) is logged and acts as "auto",
+    not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools)."""
+    kind, name = tool_choice_of(tool_choice)
+    names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+    if kind in ("auto", "none"):
+        return None
+    if kind == "required" and len(names) == 1:     # one tool to call: name it, the model cannot invent another
+        kind, name = "named", next(iter(names))
+    if kind == "required" and names:
+        return CALL_START + "\n<function="
+    if kind == "named" and name in names:
+        return CALL_START + f"\n<function={name}>\n"
+    print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "
+          "request): the model decides, as with \"auto\"", flush=True)
+    return None
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
@@ -461,6 +535,9 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     return ToolCall(name=name, arguments=args)
 
 
+RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
@@ -475,7 +552,96 @@ class OutputParser:
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
         # nothing until the call is complete, which for a large file write can be many minutes.
         self.stream_tools = stream_tools
+        # #804/#1058: calls found inside the reasoning wait here as [raw text, ToolCall | None] until the turn shows
+        # they were acts: only whitespace (or more calls) after them, then the end of the turn or `</think>`.  The
+        # reasoning text before them is tracked (code fence, inline code, current line) to tell an act from a quote.
+        self.pending: list[list] = []
+        self.rescued = 0             # calls delivered from the reasoning
+        self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
+        self.fence, self.fence_len, self.line, self.ticks = "", 0, "", 0
+        self._forced_quote_reset = False
         self._reset_scan()
+
+    @staticmethod
+    def _inline_ticks(line: str, ticks: int) -> int:
+        # Code spans close only on the same run length, not backtick parity.
+        for run in re.finditer(r"`+", line):
+            n = len(run.group())
+            if ticks:
+                if n == ticks:
+                    ticks = 0
+            else:
+                before = line[:run.start()]
+                if (len(before) - len(before.rstrip("\\"))) % 2:
+                    n -= 1              # the escape consumes one backtick, not the whole run
+                if n:
+                    ticks = n
+        return ticks
+
+    def reset_quote_tracking(self) -> None:
+        """Only for a server-written forced-call opening, never model-written text."""
+        if self.state in ("reasoning", "rcall"):
+            # Budget wrap-up first returns pending reasoning calls as text; that
+            # text may reopen a quote. Reset after its server-written </think>.
+            self._forced_quote_reset = True
+        else:
+            self.fence, self.fence_len, self.line, self.ticks = "", 0, "", 0
+
+    def _track(self, text: str) -> str:
+        """Follow the reasoning text that has gone out: the open code fence, the current line, and the backticks of
+        the current paragraph.  Returns the text."""
+        parts = text.split("\n")
+        for k, part in enumerate(parts):
+            if k < len(parts) - 1:
+                line, self.line = self.line + part, ""
+                line = line.removesuffix("\r")       # CRLF, not arbitrary trailing Unicode whitespace
+                s = line.lstrip()
+                if self.fence:
+                    n = len(s) - len(s.lstrip(self.fence))
+                    indent = len(line) - len(s)
+                    if indent <= 3 and line[:indent] == " " * indent and \
+                            n >= self.fence_len and not s[n:].strip(" \t"):
+                        self.fence, self.fence_len = "", 0
+                elif (m := re.match(r"(`{3,}|~{3,})", s)) and \
+                        (s[0] == "~" or "`" not in s[m.end():]):
+                    self.fence, self.fence_len = s[0], len(m.group())
+                    self.ticks = 0                 # a fenced block interrupts the preceding paragraph
+                elif not s:
+                    self.ticks = 0
+                else:
+                    self.ticks = self._inline_ticks(line, self.ticks)
+            else:
+                self.line += part
+        return text
+
+    def _opener_ok(self) -> bool:
+        """The reasoning text so far puts a `<tool_call>` at the start of a line, outside a code fence and outside
+        inline code."""
+        return not self.fence and not self.line.strip() and not self.ticks
+
+    def _in_code(self) -> bool:
+        """The text so far leaves the next character inside a code fence or inline code."""
+        if self.fence:
+            return True
+        s = self.line.lstrip()
+        m = re.match(r"(`{3,}|~{3,})", s)
+        return bool(m and (s[0] == "~" or "`" not in s[m.end():])) or \
+            bool(self._inline_ticks(self.line, self.ticks))
+
+    def _release(self, deliver: bool) -> list[Event]:
+        """Settle the calls waiting in self.pending: events for real calls, or all of it back as reasoning text."""
+        out = []
+        for raw, call in self.pending:
+            if call is not None and deliver:
+                out.append(Event("tool_call", call=call))
+                self.rescued += 1
+            elif call is None or not deliver:
+                if call is not None:
+                    self.refused += 1
+                if raw:
+                    out.append(Event("reasoning", self._track(raw)))
+        self.pending = []
+        return out
 
     def _reset_scan(self):
         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
@@ -601,18 +767,86 @@ class OutputParser:
         self.buf += delta
         out: list[Event] = []
         while True:
-            if self.state == "reasoning":
+            if self.state == "rcall":
+                # #804: a `<tool_call>` inside the reasoning, with tools declared.  It is held whole (never streamed
+                # as a call) until it ends: a declared name is then a tool call, anything else stays reasoning text.
+                body = self.buf[len(CALL_START):]
+                end, think = call_end(body), body.find(THINK_END)
+                if end >= 0 and (think < 0 or think >= end):
+                    call = None
+                    try:
+                        name = body[:end].strip()[len("<function="):].split(">", 1)[0]
+                        if name in self.schemas:
+                            call = parse_tool_call(body[:end], self.schemas.get(name))
+                    except ValueError:
+                        pass
+                    raw = self.buf[:len(CALL_START) + end + len(CALL_END)]
+                    if call is not None or self.pending:
+                        self.pending.append([raw, call])    # settled by what follows it (see __init__)
+                    else:
+                        out.append(Event("reasoning", self._track(raw)))
+                    self.buf = body[end + len(CALL_END):]
+                    self.state = "reasoning"
+                elif think >= 0:                     # the thinking ended inside it: it never was a call
+                    out += self._release(False)
+                    out.append(Event("reasoning", self._track(self.buf[:len(CALL_START) + think])))
+                    self.buf = body[think:]
+                    self.state = "reasoning"
+                elif len(body) > RCALL_MAX:          # a tag in the prose that never closes: stop holding the thinking back
+                    out += self._release(False)
+                    out.append(Event("reasoning", self._track(self.buf)))
+                    self.buf = ""
+                    self.state = "reasoning"
+                else:
+                    return out
+            elif self.state == "reasoning":
+                if self.pending:
+                    # calls wait for what follows: more calls or whitespace keep them, `</think>` makes them acts,
+                    # any other text means they were quoted
+                    stripped = self.buf.lstrip()
+                    if len(stripped) < len(self.buf):
+                        self.pending[-1][0] += self.buf[:len(self.buf) - len(stripped)]
+                        self.buf = stripped
+                    if not self.buf:
+                        return out
+                    if self.buf.startswith(CALL_START):
+                        self.state = "rcall"
+                    elif self.buf.startswith(THINK_END):
+                        out += self._release(True)
+                    elif CALL_START.startswith(self.buf) or THINK_END.startswith(self.buf):
+                        return out
+                    else:
+                        out += self._release(False)
+                    continue
                 i = self.buf.find(THINK_END)
+                tool = self.buf.find(CALL_START) if self.schemas else -1
+                if tool >= 0 and (i < 0 or tool < i):
+                    if tool:
+                        out.append(Event("reasoning", self._track(self.buf[:tool])))
+                    if self._opener_ok():
+                        self.buf = self.buf[tool:]
+                        self.state = "rcall"
+                    else:                            # mid-sentence, in a fence or in inline code: a quote
+                        out.append(Event("reasoning", self._track(CALL_START)))
+                        self.buf = self.buf[tool + len(CALL_START):]
+                    continue
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END,))
+                    keep = self._hold(self.buf, (THINK_END, CALL_START) if self.schemas else (THINK_END,))
                     if len(self.buf) > keep:
-                        out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
+                        out.append(Event("reasoning", self._track(self.buf[:len(self.buf) - keep])))
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
                 if i:
-                    out.append(Event("reasoning", self.buf[:i]))
+                    out.append(Event("reasoning", self._track(self.buf[:i])))
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
+                # A reasoning delimiter is not a Markdown quote closer. Commit
+                # its partial line, retaining any open fence/span in the answer.
+                if self.line:
+                    self._track("\n")
+                if self._forced_quote_reset:
+                    self._forced_quote_reset = False
+                    self.reset_quote_tracking()
             elif self.state == "content":
                 if self.lead:                                   # newlines right after </think> or a call
                     stripped = self.buf.lstrip("\n")
@@ -628,11 +862,37 @@ class OutputParser:
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
                     if j > 0:
-                        out.append(Event("content", self.buf[:j]))
+                        out.append(Event("content", self._track(self.buf[:j])))
+                        self.buf = self.buf[j:]
+                    return out
+                # #1058: an opener inside a code fence or inline code is text (a quoted example), never a call.  The
+                # text before it decides, so streamed and whole outputs agree.  Mid-sentence openers still count.
+                snap = (self.fence, self.fence_len, self.line, self.ticks)
+                self._track(self.buf[:i])
+                in_code = self._in_code()
+                self.fence, self.fence_len, self.line, self.ticks = snap
+                if in_code:
+                    out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
+                    self.buf = self.buf[i + len(CALL_START):]
+                    continue
+                # A call is `<tool_call>` and then (after whitespace) `<function=`; the tag with anything else after
+                # it is prose that names the format ("I'll use a <tool_call> block") - content, not a malformed call
+                # that ends the request.  Until its follower has arrived it is held, like a partial tag.
+                after = self.buf[i + len(CALL_START):].lstrip()
+                if after and not after.startswith(FUNC_START) and not FUNC_START.startswith(after):
+                    out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
+                    self.buf = self.buf[i + len(CALL_START):]
+                    continue
+                if not after.startswith(FUNC_START):
+                    j = i
+                    while j > 0 and self.buf[j - 1] == "\n":
+                        j -= 1
+                    if j > 0:
+                        out.append(Event("content", self._track(self.buf[:j])))
                         self.buf = self.buf[j:]
                     return out
                 if i and self.buf[:i].strip():
-                    out.append(Event("content", self.buf[:i].rstrip("\n")))
+                    out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
             else:
@@ -657,10 +917,14 @@ class OutputParser:
                 self._reset_scan()
                 self.state, self.lead = "content", True
 
-    def finish(self) -> list[Event]:
+    def finish(self, reason: str | None = None) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
-        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211)."""
+        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211).  `reason` is
+        how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
+        a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
         out = []
+        if self.pending:
+            out += self._release(reason in (None, "stop") and self.state == "reasoning" and not self.buf)
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
             if self.ss == "done":               # only its </tool_call> is missing: the call itself is whole
@@ -669,7 +933,8 @@ class OutputParser:
             self._reset_scan()
             return out
         if self.buf:
-            kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
+            # an unfinished call inside the reasoning (#804) is reasoning text, never a call
+            kind = {"reasoning": "reasoning", "rcall": "reasoning", "content": "content"}.get(self.state, "content")
             text = self.buf if self.state != "call" else CALL_START + self.buf
             out.append(Event(kind, text))
             self.buf = ""

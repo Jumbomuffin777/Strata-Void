@@ -6,6 +6,25 @@ Strata Void's own releases. Upstream Strata's changes are in its history and
 Strata Void's version numbers are its own, independent of upstream's engine versions (0.1.x). Its tags are named
 `void-vX.Y.Z` so they never collide with upstream's `vX.Y.Z` tags.
 
+## void-v0.1.1 (2026-10-11)
+
+**Server protocol fixes, not a new SYCL kernel optimization**
+
+- Port selected upstream fixes with original authors and source-commit attribution: honor `tool_choice`; tolerate malformed historical arguments; map flat namespace aliases; preserve images in Anthropic tool results; report invalid tool schemas as HTTP 400.
+- Distinguish executable declared calls from quoted tool-call markup in reasoning and visible code examples. A scoped publication review corrected long-fence and multi-backtick tracking across reasoning boundaries while preserving server-written forced calls. Reasoning calls cut by length/cancel/error remain text; incomplete wrappers have a bounded buffer. Streamed and whole parsing are regression-tested.
+- Keep agent conversations on the ordinary path so Task-Parallel decomposition does not lose tool calls/results, including when current tools are suppressed with `tool_choice: none`.
+- Poll quiet-engine cancellation every 0.5 seconds without increasing HTTP heartbeat frequency, and explicitly close HTTP/1.0 connections. Native prompt-chunk cancellation latency is not newly qualified.
+- Add parser specimens and HTTP/cancellation regression tests; make the optional `jsonschema` test dependency explicit. Scoped result: 315 tests passed, 1 optional test skipped, and 11 SYCL setup checks passed. Inert image-selector comparisons establish unchanged API-caller authority, without fetching URLs or reading image targets.
+
+**Newly documented external integrations**
+
+- IQ3_S inference and separate 32K/fp16 and 128K/int8 profile loading, alongside retained Swift IQ4_XS inference, on Arc Pro B70 32 GB + B65 32 GB + B60 24 GB. IQ3_S filled-128K reliability remains untested.
+- OMP 18.3.4 coding edit plus approved real test execution, and REA 6.4.0 MCP static analysis with exact Evidence/result verification through OMP. These tools, approvals and OS containment belong to external harnesses, not the native engine.
+- 50.6 tok/s live IQ3_S generation sample, its fixed workload and server-observed 2-second-window measurement method. No benchmark speedup is claimed.
+- Generic IQ3_S profiles, OMP model/approval examples and a disabled-by-default upstream REA stdio registration. No private controller, configuration, credentials, workspace contents, binary or weights are included.
+
+See [AGENT_INTEGRATION](docs/AGENT_INTEGRATION.md) and the [aggregate summary](bench/results/2026-10-11-agent-compatibility/summary.json). Existing upstream MIT attribution, earlier benchmarks and functionality are preserved.
+
 ## void-v0.1.0 (2026-10-07)
 
 First public release. Measured on three Intel Arc Pro GPUs (B70 + B65 + B60, 88 GB) with Swift 1.5 Qwen3.8

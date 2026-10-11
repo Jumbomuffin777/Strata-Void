@@ -27,6 +27,8 @@ jobs:
           cache-dependency-path: requirements.txt
       - name: Install
         run: python -m pip install -r requirements.txt
+      - name: Agent protocol and quiet cancellation
+        run: python -m unittest serve.test_server serve.test_reasoning_tools serve.test_reasoning_rescue serve.test_quiet_cancel serve.test_responses -v
       - name: Task-parallel requests
         run: python -m unittest serve.test_task_parallel serve.test_task_parallel_v2 -v
       - name: Batch slots in the server

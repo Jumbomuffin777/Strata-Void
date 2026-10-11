@@ -1,0 +1,376 @@
+{
+ "_about": "Recorded and constructed reasoning outputs for #804/#1058. 25 entries from PR #525's corpus (talisp, 47Hunter47 and reviewers) and 12 live strandings recovered by 47Hunter47 (https://gist.github.com/47Hunter47/4abcd3a80701f5634f85b96e4c067cc3). 'calls' = the tool names delivered as calls under the #1058 rules. Mixed tails (a declared call beside a wrapper call naming no declared tool): the declared call is delivered, the wrapper stays reasoning.",
+ "specimens": [
+  {
+   "name": "act-natural-stop",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "The user asked what the file contains. Reading it first is the right step, and then I can summarize what is inside.\n\n<tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "execute_code"
+   ]
+  },
+  {
+   "name": "act-first-text",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "<tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "execute_code"
+   ]
+  },
+  {
+   "name": "act-two-adjacent",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "The comparison needs both files. I will read them one after the other.\n\n<tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "execute_code",
+    "execute_code"
+   ]
+  },
+  {
+   "name": "envelope-undeclared",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "The tool for this step is not in my visible list, so it goes through the wrapper with a single entry.\n\n<tool_call>\n<function=tool_call>\n<parameter=calls>\n[{\"name\": \"execute_code\", \"arguments\": {\"code\": \"print(1)\"}}]\n</parameter>\n</function>\n</tool_call>",
+   "calls": []
+  },
+  {
+   "name": "envelope-declared",
+   "finish": "stop",
+   "tools": [
+    "execute_code",
+    "tool_call"
+   ],
+   "input": "The tool for this step is not in my visible list, so it goes through the wrapper with a single entry.\n\n<tool_call>\n<function=tool_call>\n<parameter=calls>\n[{\"name\": \"execute_code\", \"arguments\": {\"code\": \"print(1)\"}}]\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "tool_call"
+   ]
+  },
+  {
+   "name": "mention-backticks-midsentence",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "Before answering, a note on the wire protocol: I must emit `<tool_call>` then `<function=execute_code>` - the format.\nWith that settled, the plan is clear.",
+   "calls": []
+  },
+  {
+   "name": "mention-midsentence-whole-call",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "The format is <tool_call>\n<function=execute_code>\n</function>\n</tool_call> ok.\nI will follow it for the real call next.",
+   "calls": []
+  },
+  {
+   "name": "mention-backticks-line-start",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "Plan:\n`<tool_call>\n<function=execute_code>` comes next.\nThat is the shape the harness wants.",
+   "calls": []
+  },
+  {
+   "name": "mention-line-start-no-function",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "Next step:\n<tool_call> is the tag the format starts with.\nThe parameters follow it.",
+   "calls": []
+  },
+  {
+   "name": "mention-line-start-other-tag",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "Example:\n<tool_call>\n<parameter=code>\nx\n</parameter>\nThe body would continue here.",
+   "calls": []
+  },
+  {
+   "name": "mention-indented",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "As a list:\n  <tool_call>\n  <function=execute_code>\n  ...and so on for each field.\nThat covers the layout.",
+   "calls": []
+  },
+  {
+   "name": "mention-markdown-quote",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "The doc says:\n> <tool_call>\n> <function=execute_code>\nand that is all it says about calling.",
+   "calls": []
+  },
+  {
+   "name": "mention-backtick-block",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "Format:\n```xml\n<tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>\n```\nThat is how a call looks, for reference.",
+   "calls": []
+  },
+  {
+   "name": "mention-tilde-block",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "Format:\n~~~\n<tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>\n~~~\nDone, that is the whole example.",
+   "calls": []
+  },
+  {
+   "name": "mention-tag-before-think-end",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "So I call it:\n<tool_call>\n</think>Here is the answer to your question.",
+   "calls": []
+  },
+  {
+   "name": "mention-closed-span-fenced",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "This is a documentation example, not an action:\n```xml\n<tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>\n```\nI should explain it without calling any tool.\n</think>Here is the explanation.",
+   "calls": []
+  },
+  {
+   "name": "mention-unclosed-disclaimed",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "This is a documentation example, not an action:\n```xml\n<tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>\n```\nI should explain it without calling any tool.",
+   "calls": []
+  },
+  {
+   "name": "cut-max-tokens",
+   "finish": "length",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "I could run\n<tool_call>\n<function=execute_code>\n<parameter=code>\nrm -rf build\n</parameter>\n</function>\n</tool_call>\nbut first let me check what build holds...",
+   "calls": []
+  },
+  {
+   "name": "mention-midsentence-declared",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "I could run <tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>",
+   "calls": []
+  },
+  {
+   "name": "mention-trailing-prose",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "The file is small, so one read is enough.\n<tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>\nlet me see what comes back.",
+   "calls": []
+  },
+  {
+   "name": "mention-prose-between-calls",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "Both are needed.\n<tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call> and also <tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>",
+   "calls": []
+  },
+  {
+   "name": "mention-empty-span",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "Next:\n<tool_call>\n</tool_call>\nNothing further to add.",
+   "calls": []
+  },
+  {
+   "name": "known-miss-bare-function-opener",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "Let me run it.\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>",
+   "calls": []
+  },
+  {
+   "name": "normal-call-after-think-end",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "I must emit `<tool_call>` then `<function=execute_code>` - the format.\n</think>\n\n<tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "execute_code"
+   ]
+  },
+  {
+   "name": "mixed-declared-and-envelope",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "Two things to do, so both calls go out together.\n\n<tool_call>\n<function=execute_code>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=tool_call>\n<parameter=calls>\n[{\"name\": \"execute_code\", \"arguments\": {\"code\": \"print(1)\"}}]\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "execute_code"
+   ]
+  },
+  {
+   "name": "live-01-declared",
+   "finish": "stop",
+   "tools": [
+    "terminal"
+   ],
+   "input": "Inspect the authorized test artifact.\n\n<tool_call>\n<function=terminal>\n<parameter=command>\ninspect-fixture --read example.txt\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "terminal"
+   ]
+  },
+  {
+   "name": "live-02-declared",
+   "finish": "length",
+   "tools": [
+    "read_file"
+   ],
+   "input": "Inspect the authorized test artifact.\n\n<tool_call>\n<function=read_file>\n<parameter=path>\nfixtures/example.txt\n</parameter>\n<parameter=limit>\n120\n</parameter>\n</function>\n</tool_call>",
+   "calls": []
+  },
+  {
+   "name": "live-03-envelope",
+   "finish": "stop",
+   "tools": [
+    "terminal"
+   ],
+   "input": "Inspect the authorized test artifact.\n\n<tool_call>\n<function=tool_call>\n<parameter=calls>\n[{\"arguments\": {\"note_name\": \"Projeler/<project>\n</parameter>\n</function>\n</tool_call>",
+   "calls": []
+  },
+  {
+   "name": "live-04-declared",
+   "finish": "stop",
+   "tools": [
+    "terminal",
+    "web_extract"
+   ],
+   "input": "Inspect the authorized test artifact.\n\n<tool_call>\n<function=terminal>\n<parameter=command>\ninspect-fixture --read example.txt\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=web_extract>\n<parameter=char_limit>\n8000\n</parameter>\n<parameter=urls>\n[\"https://hermes-agent.nousresearch.com/docs/user-guide/features/vision\"]\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "terminal",
+    "web_extract"
+   ]
+  },
+  {
+   "name": "live-05-declared",
+   "finish": "stop",
+   "tools": [
+    "terminal"
+   ],
+   "input": "Inspect the authorized test artifact.\n\n<tool_call>\n<function=terminal>\n<parameter=command>\ninspect-fixture --read example.txt\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "terminal"
+   ]
+  },
+  {
+   "name": "live-06-envelope",
+   "finish": "stop",
+   "tools": [
+    "todo_list"
+   ],
+   "input": "Inspect the authorized test artifact.\n\n<tool_call>\n<function=todo_list>\n<parameter=todos>\n[{\"content\": \"Tum profillerdeki skill dizinlerini keşfet\", \"id\": \"1\", \"status\": \"completed …\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=tool_call>\n<parameter=calls>\n[{\"name\": \"mcp__obsidian_vault__mcp_obsidian_create_note\", \"arguments\": {\"path\": \"AI Stack …\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "todo_list"
+   ]
+  },
+  {
+   "name": "live-07-declared",
+   "finish": "stop",
+   "tools": [
+    "search_files"
+   ],
+   "input": "Inspect the authorized test artifact.\n\n<tool_call>\n<function=search_files>\n<parameter=context>\n2\n</parameter>\n<parameter=output_mode>\ncontent\n</parameter>\n<parameter=path>\nfixtures/example.txt\n</parameter>\n<parameter=pattern>\nemulat|Emulat|borç|kopya\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "search_files"
+   ]
+  },
+  {
+   "name": "live-08-declared",
+   "finish": "stop",
+   "tools": [
+    "terminal"
+   ],
+   "input": "Inspect the authorized test artifact.\n\n<tool_call>\n<function=terminal>\n<parameter=command>\ninspect-fixture --read example.txt\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "terminal"
+   ]
+  },
+  {
+   "name": "live-09-declared",
+   "finish": "stop",
+   "tools": [
+    "execute_code"
+   ],
+   "input": "Inspect the authorized test artifact.\n\n<tool_call>\n<function=execute_code>\n<parameter=code>\nimport re\ndef show(pat, label, maxn=30):\n    hits=[r for r in recs if re.search(pat, r.get …\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "execute_code"
+   ]
+  },
+  {
+   "name": "live-10-declared",
+   "finish": "stop",
+   "tools": [
+    "terminal"
+   ],
+   "input": "Inspect the authorized test artifact.\n\n<tool_call>\n<function=terminal>\n<parameter=command>\ninspect-fixture --read example.txt\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "terminal"
+   ]
+  },
+  {
+   "name": "live-11-declared",
+   "finish": "stop",
+   "tools": [
+    "terminal"
+   ],
+   "input": "Inspect the authorized test artifact.\n\n<tool_call>\n<function=terminal>\n<parameter=command>\ninspect-fixture --read example.txt\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=terminal>\n<parameter=command>\ninspect-fixture --read example.txt\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "terminal",
+    "terminal"
+   ]
+  },
+  {
+   "name": "live-12-declared",
+   "finish": "stop",
+   "tools": [
+    "web_extract"
+   ],
+   "input": "Inspect the authorized test artifact.\n\n<tool_call>\n<function=web_extract>\n<parameter=char_limit>\n25000\n</parameter>\n<parameter=urls>\n[\"https://raw.githubusercontent.com/Niko1221/Strata/main/DETAILS.md\", \"https://raw.githubu …\n</parameter>\n</function>\n</tool_call>",
+   "calls": [
+    "web_extract"
+   ]
+  }
+ ],
+ "privacy_note": "Live-derived cases use inert generic prose, command values and paths. Tool names, wrappers, finish conditions and expected call classifications are preserved."
+}

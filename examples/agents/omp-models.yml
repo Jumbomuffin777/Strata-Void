@@ -1,0 +1,27 @@
+# Generic loopback example for OMP 18.3.4. No credentials or lifecycle wrapper.
+# The running server must actually use the 32K IQ3_S profile.
+providers:
+  strata:
+    baseUrl: http://localhost:8095/v1
+    api: openai-completions
+    auth: none
+    models:
+      - id: flash-next-iq3s
+        name: Strata Void - Flash-Next IQ3_S - 32K
+        reasoning: true
+        supportsTools: true
+        tokenizer: qwen3
+        input: [text]
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+        contextWindow: 32768
+        maxTokens: 8192
+        compat:
+          supportsDeveloperRole: false
+          supportsStore: false
+          supportsReasoningEffort: true
+          supportsStrictMode: false
+          maxTokensField: max_tokens

@@ -1,0 +1,93 @@
+{
+  "date": "2026-10-11",
+  "scope": "one Intel Arc reference system; short functional checks, not a broad benchmark",
+  "hardware": {
+    "gpus": [
+      {
+        "model": "Intel Arc Pro B70",
+        "vram_gb": 32
+      },
+      {
+        "model": "Intel Arc Pro B65",
+        "vram_gb": 32
+      },
+      {
+        "model": "Intel Arc Pro B60",
+        "vram_gb": 24
+      }
+    ],
+    "backend": "SYCL"
+  },
+  "models": {
+    "iq3s": "Qwen3.8-Flash-Next-GSQ-RCO IQ3_S",
+    "iq4xs": "Swift 1.5 Qwen3.8 Flash-Next IQ4_XS"
+  },
+  "profiles": [
+    {
+      "model": "iq3s",
+      "context": 32768,
+      "kv": "fp16",
+      "layer_split": "18,35",
+      "load_and_short_inference": "passed"
+    },
+    {
+      "model": "iq3s",
+      "context": 131072,
+      "kv": "int8",
+      "layer_split": "18,36",
+      "load_and_short_inference": "passed",
+      "full_context_reliability": "not tested"
+    },
+    {
+      "model": "iq4xs",
+      "context": 32768,
+      "kv": "fp16",
+      "layer_split": "18,35",
+      "inference": "passed"
+    }
+  ],
+  "decode_probe": {
+    "model": "iq3s",
+    "context": 32768,
+    "batch": 4,
+    "batch_groups": 2,
+    "prefill": 2048,
+    "spec": 4,
+    "spec_min_p": 0.5,
+    "experts": "VRAM",
+    "vram_reserve_mib": 512,
+    "workload": "examples/agents/iq3s-decode-probe.json",
+    "live_sample_tok_s": 50.6,
+    "source": "Strata GET /metrics live.tok_s",
+    "measurement": "server-observed accepted-token delta over a 2-second sliding window during generation; one active request",
+    "native_reference_tok_s": 51.1,
+    "native_reference_scope": "a previous completed decode segment of the same workload, not the concurrent live sample",
+    "repeat_request": {
+      "prompt_tokens": 41,
+      "cached_prompt_tokens": 34,
+      "completion_tokens": 750,
+      "client_elapsed_s": 14.854587078094482
+    },
+    "speedup_claim": false
+  },
+  "external_agents": {
+    "omp_version": "18.3.4",
+    "provider_api": "openai-completions",
+    "coding_edit": "passed",
+    "approved_test_exit": 0,
+    "tests_passed": 1,
+    "rea_version": "6.4.0",
+    "rea_mcp_analysis": "passed",
+    "actual_tool_result_and_model_response_compared": true,
+    "analysis_relevant_files": 3,
+    "analysis_parsed_javascript_files": 2,
+    "analysis_parse_failures": 0,
+    "rea_mode": "read-only JavaScript analysis with supported summary projection",
+    "containment": "deployment-provided restricted adapter; not included in Strata Void"
+  },
+  "lifecycle": {
+    "deployment_on_demand_load_and_offload": "passed",
+    "provided_by": "external lifecycle controller, not OMP or REA or a new repository wrapper"
+  },
+  "raw_private_logs_published": false
+}

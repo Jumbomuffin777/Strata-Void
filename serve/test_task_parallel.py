@@ -477,6 +477,20 @@ class Http(unittest.TestCase):
         self.assertEqual(s, 200)
         self.assertNotIn("task_parallel", b)
 
+    def test_agent_turns_run_as_usual(self):
+        """Tool calls/results already in the conversation (an agent's loop) or tools withheld by tool_choice "none":
+        the ordinary request, never task-parallel steps that would drop the tool results."""
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+        history = [{"role": "user", "content": BIG},
+                   {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
+                                                                       "function": {"name": "f", "arguments": "{}"}}]},
+                   {"role": "tool", "tool_call_id": "c1", "content": "42"}]
+        for body in ({"model": "m", "messages": history, "max_tokens": 64, "task_parallel": 2},
+                     self.body(task_parallel=2, tools=tools, tool_choice="none")):
+            s, b = self.post(body)
+            self.assertEqual(s, 200)
+            self.assertNotIn("task_parallel", b)
+
 
 if __name__ == "__main__":
     unittest.main()

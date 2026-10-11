@@ -28,6 +28,16 @@ measured on 3 Intel Arc Pro GPUs (88 GB)</p>
 Everything else is upstream Strata: the engine, the OpenAI/Anthropic-compatible server, the CUDA/HIP builds, setup.
 The upstream README (with translations) is kept as [README.strata.md](README.strata.md).
 
+## Validated Intel Arc coding-agent workflows
+
+The latest server update includes attributed upstream tool-call and cancellation fixes. On **B70 32 GB + B65 32 GB + B60 24 GB**, Swift **IQ4_XS** and Flash-Next **IQ3_S** completed real inference. IQ3_S also completed an **OMP 18.3.4** code edit and approved test, and a real **REA 6.4.0 MCP** analysis whose returned Evidence matched the model's response.
+
+- **32K and 128K IQ3_S profiles loaded and answered short requests.** Full-context 128K reliability remains untested for this profile.
+- **50.6 tok/s live** was observed on a short, single-stream IQ3_S 32K code-review-list request: Strata's server-observed accepted-token rate over a 2-second window, not a new kernel speedup or agent-task throughput.
+- Strata provides OpenAI-compatible function-call transport; **OMP executes coding tools and enforces approvals**, and REA supplies analysis. The external lifecycle controller used for on-demand loading/offloading is not bundled here.
+
+Setup examples, measurement method and precise limits: [AGENT_INTEGRATION](docs/AGENT_INTEGRATION.md). These are **tested and functionally validated results on the specified Intel Arc hardware**, not official upstream support or a universal stability claim. No private deployment infrastructure is included.
+
 ## Task-Parallel Requests in one picture
 
 Batching normally uses concurrency to serve several independent requests. Strata Void applies that capacity
@@ -271,7 +281,7 @@ Strata Void is free and open source. If it has helped your local LLM setup and y
 
 - **Strata** (engine, server, setup, the SYCL port) is the work of **Niko1221 and the Strata contributors**
   ([upstream](https://github.com/Niko1221/Strata)); the SYCL port was started by maxfridbe (#423).
-- **Task-Parallel Requests**, the Strata Void direction and the Zability test system: **Jumbomuffin777**.
+- **Task-Parallel Requests**, the Strata Void direction and the Intel Arc reference system: **Jumbomuffin777**.
   Implementation, debugging and benchmarking were AI-assisted (Claude) under his direction.
 - Task decomposition, map-reduce over documents and parallel LLM execution are established concepts. Strata Void
   integrates them into Strata's batching and serving architecture: automatic task selection, concurrent subtasks,

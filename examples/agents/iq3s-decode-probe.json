@@ -1,0 +1,15 @@
+{
+  "model": "flash-next-iq3s",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Write a numbered list of 40 concise practical code-review checks, each one sentence. No tools and no commentary before or after the list."
+    }
+  ],
+  "stream": true,
+  "max_tokens": 768,
+  "temperature": 0,
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  }
+}

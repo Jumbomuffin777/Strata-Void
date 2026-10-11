@@ -242,6 +242,50 @@ class ImageMarkers(unittest.TestCase):
                     self.assertIn("<|image_pad|> marks" if "docs" in text else "plain", tok.decode(ids))
             svc.embeddings.path.unlink(missing_ok=True)
 
+    def test_anthropic_tool_result_image(self):
+        """Claude Code's Read of a picture returns it inside a tool_result: it reaches the encoder, in place."""
+        import tempfile
+        from serve.frontend import anthropic_to_messages
+        tok = ByteTokenizer()
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+        call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "a.png"}}]}
+        with tempfile.TemporaryDirectory() as d:
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                          vision=self.FakeVision(d))
+            pad = tok.encode("<|image_pad|>", parse_special=True)[0]
+            for result, extra, n in (([img], [], 3), ([{"type": "text", "text": "a.png"}, img], [], 3),
+                                     ("plain text", [img, {"type": "text", "text": "and this one"}], 3),
+                                     ([img], [img], 6)):
+                with self.subTest(result=str(result)[:30], extra=len(extra)):
+                    msgs = [{"role": "user", "content": "look at a.png"}, call,
+                            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": result}] + extra}]
+                    m, _, _ = anthropic_to_messages({"messages": msgs})
+                    ids, _, _ = svc.prepare(m, None, {})
+                    self.assertEqual(ids.count(pad), n)
+                    prompt = tok.decode(ids)
+                    inside = prompt.split("<tool_response>", 1)[1].split("</tool_response>", 1)[0]
+                    self.assertEqual("<|vision_start|>" in inside, not isinstance(result, str))
+                    self.assertEqual("<|vision_start|>" in prompt.split("</tool_response>", 1)[1], bool(extra))
+            svc.embeddings.path.unlink(missing_ok=True)
+        # a text-only tool result renders exactly as before: one string
+        msgs = [{"role": "user", "content": "q"}, call,
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "r"}]}]}]
+        self.assertEqual(anthropic_to_messages({"messages": msgs})[0][-1], {"role": "tool", "content": "r"})
+
+    def test_tool_result_image_selectors_match_existing_user_images(self):
+        # Converter-only comparison: no URL fetch, filesystem read or image decode.
+        from serve.frontend import anthropic_to_messages, images_of
+        for source in ({"url": "http://localhost:9999/example.png"}, {"path": "fixtures/example.png"},
+                       {"type": "base64", "media_type": "image/png", "data": "AAAA"}):
+            image = {"type": "image", "source": source}
+            user = anthropic_to_messages({"messages": [{"role": "user", "content": [image]}]})[0]
+            result = anthropic_to_messages({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [image]}]}]})[0]
+            self.assertEqual(images_of(user), images_of(result))
+        text = anthropic_to_messages({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "http://localhost:9999/example.png"}]}]})[0]
+        self.assertEqual(images_of(text), [])
+
 
 class ThinkTokenizer(ByteTokenizer):
     """The byte tokenizer with the model's reasoning markers as specials that are matched even without parse_special,
@@ -482,6 +526,41 @@ class ToolCallTerminators(unittest.TestCase):
                         self.assertEqual(json.loads(streamed), {"path": "doc.md", "content": self.CONTENT})
 
 
+class ToolCallTagInProse(unittest.TestCase):
+    """A reply that names the `<tool_call>` tag in its prose before the real call keeps the tag as content and still
+    returns the call; it was a "malformed tool call" ValueError that ended the request.  A call is the tag followed
+    (after whitespace) by `<function=`."""
+    SCHEMA = ToolCallTerminators.SCHEMA
+    CALL = ("<tool_call>\n<function=write>\n<parameter=path>\na.md\n</parameter>\n<parameter=content>\nhi\n"
+            "</parameter>\n</function>\n</tool_call>")
+
+    def parse(self, text, stream_tools, step):
+        from serve.frontend import OutputParser
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=stream_tools)
+        evs = []
+        for i in range(0, len(text), step):
+            evs += p.feed(text[i:i + step])
+        evs += p.finish()
+        return ([e.call.arguments for e in evs if e.kind == "tool_call"],
+                "".join(e.text for e in evs if e.kind == "content"))
+
+    def test_named_tag_is_content(self):
+        call = {"path": "a.md", "content": "hi"}
+        for prose in ("I will use the `<tool_call>` format now.", "Next I emit a <tool_call> block.",
+                      "Two tags <tool_call> and <tool_call>x, then the call."):
+            for stream_tools in (False, True):
+                for step in (1, 7, 10_000):
+                    with self.subTest(prose=prose, stream_tools=stream_tools, step=step):
+                        calls, content = self.parse(f"</think>\n\n{prose}\n{self.CALL}", stream_tools, step)
+                        self.assertEqual((calls, content), ([call], prose))
+
+    def test_tag_alone_at_the_end_is_content(self):
+        for step in (1, 7, 10_000):
+            with self.subTest(step=step):
+                self.assertEqual(self.parse("</think>\n\nThe format starts with <tool_call>", False, step),
+                                 ([], "The format starts with <tool_call>"))
+
+
 class UnfinishedToolCall(unittest.TestCase):
     """#211: a call the output ends inside is not reported as a whole one - its streamed JSON is not closed and the
     finish reason is not "tool_calls" / "tool_use" - so a client can tell it from a call to run."""
@@ -700,6 +779,30 @@ class ClientShapes(unittest.TestCase):
         status, b = self.post("/v1/chat/completions", {"model": "x", "max_tokens": 8, "messages": msgs})
         self.assertEqual(status, 200, b)                            # the server goes on
 
+    def test_a_tool_schema_that_is_not_an_object_is_a_400(self):
+        # #592 follow-up: a tool whose "parameters" (OpenAI) / "input_schema" (Anthropic) is a string, a number or a
+        # list passed the check above and raised later instead - AttributeError in parse_tool_call / the stream
+        # parser's `.get("properties")` on the model's first call of that tool, after the 200 and part of the reply
+        # had gone out.  Now a 400 naming the tool and the field, before anything is sent.
+        msgs = [{"role": "user", "content": "hi"}]
+        bad = {"/v1/chat/completions": ([{"type": "function", "function": {"name": "f", "parameters": "x"}}],
+                                        [{"name": "f", "parameters": ["a"]}], [{"name": "f", "parameters": 5}]),
+               "/v1/messages": ([{"name": "f", "input_schema": "x"}], [{"name": "f", "input_schema": [1]}],
+                                [{"name": "f", "input_schema": True}])}
+        for path, shapes in bad.items():
+            for tools in shapes:
+                with self.subTest(path=path, tools=tools):
+                    status, b = self.post(path, {"model": "x", "max_tokens": 8, "messages": msgs, "tools": tools})
+                    self.assertEqual(status, 400, b)
+                    self.assertIn("tools[0] (f)", b["error"]["message"])
+                    self.assertIn("must be an object", b["error"]["message"])
+        for path, tools in (("/v1/chat/completions", [{"name": "f"}]),              # absent, null and {} go on
+                            ("/v1/chat/completions", [{"name": "f", "parameters": None}]),
+                            ("/v1/messages", [{"name": "f", "input_schema": {}}])):
+            with self.subTest(path=path, tools=tools):
+                status, b = self.post(path, {"model": "x", "max_tokens": 8, "messages": msgs, "tools": tools})
+                self.assertEqual(status, 200, b)
+
     def test_well_formed_tools_still_work(self):
         msgs = [{"role": "user", "content": "hi"}]
         fn = {"name": "get_weather", "description": "the weather", "parameters": {"type": "object", "properties": {}}}
@@ -765,6 +868,42 @@ class ClientShapes(unittest.TestCase):
         for calls in (["f"], "[1]", [{"function": "f"}], "{"):
             with self.subTest(calls=calls), self.assertRaisesRegex(ValueError, "tool_calls must be a list of objects"):
                 openai_to_messages({"messages": [{"role": "assistant", "content": "", "tool_calls": calls}]})
+
+    def test_tool_call_malformed_arguments_fallback(self):
+        from serve.frontend import openai_to_messages
+        bad_call = [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{malformed_json"}}]
+        msgs, tools, kwargs = openai_to_messages({"messages": [{"role": "user", "content": "u"},
+                                                               {"role": "assistant", "content": "", "tool_calls": bad_call}]})
+        self.assertEqual(msgs[1]["tool_calls"], [{"function": {"name": "f", "arguments": {"arguments": "{malformed_json"}}}])
+        tpl = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        rendered = tpl.render(msgs, tools=tools, **kwargs)
+        self.assertIn("<function=f>", rendered)
+        self.assertIn("<parameter=arguments>\n{malformed_json", rendered)
+
+
+class ToolArguments(unittest.TestCase):
+    """#510: one helper for both frontends; a history whose arguments are not a JSON object is kept, not a 500."""
+
+    def test_helper(self):
+        from serve.frontend import tool_arguments
+        for raw, want in ((None, {}), ("", {}), ("  ", {}), ({"a": 1}, {"a": 1}), ('{"a": 1}', {"a": 1}),
+                          ("{cut", {"arguments": "{cut"}), ("[1, 2]", {"arguments": "[1, 2]"}),
+                          ("5", {"arguments": "5"}), ([1, 2], {"arguments": "[1, 2]"}), (7, {"arguments": "7"})):
+            with self.subTest(raw=raw):
+                self.assertEqual(tool_arguments(raw), want)
+
+    def test_both_frontends_render_it(self):
+        from serve.frontend import anthropic_to_messages, openai_to_messages
+        for bad in ("{cut", "[1]", "3"):
+            with self.subTest(bad=bad):
+                m = openai_to_messages({"messages": [{"role": "user", "content": "u"}, {"role": "assistant", "content": "",
+                    "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": bad}}]}]})[0]
+                self.assertEqual(m[1]["tool_calls"][0]["function"]["arguments"], {"arguments": bad})
+        for bad in ([1], 3, "{cut"):
+            with self.subTest(anthropic=bad):
+                m = anthropic_to_messages({"messages": [{"role": "user", "content": "u"}, {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t", "name": "f", "input": bad}]}]})[0]
+                self.assertIn("arguments", m[1]["tool_calls"][0]["function"]["arguments"])
 
 
 class SamplingKeys(unittest.TestCase):
@@ -2160,6 +2299,192 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(self.engine.prompts, [])
 
 
+class CallingEngine(MockEngine):
+    """Thinks, then answers in text - unless its prompt already opens a call (a forced tool_choice): then it finishes
+    that call.  Records every prompt it is given."""
+    THOUGHT = "I could look this up. " * 8                  # 176 reasoning tokens (one per byte)
+    ANSWER = "The answer is 4."
+    ARGS = "<parameter=q>\n2+2\n</parameter>\n</function>\n</tool_call>"
+
+    def __init__(self, tok):
+        super().__init__(tok, "x", max_context=CTX)
+        self.prompts = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        prompt = self.tok.decode(ids)
+        if prompt.endswith("<function="):
+            text = "search>\n" + self.ARGS
+        elif prompt.endswith("<function=search>\n"):
+            text = self.ARGS
+        elif prompt.endswith("</think>\n\n"):
+            text = self.ANSWER
+        else:
+            text = self.THOUGHT + "</think>\n\n" + self.ANSWER
+        for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class ForcedToolChoice(unittest.TestCase):
+    """tool_choice "required" or a named function: the server writes the call's opening - after the thinking, or at
+    the end of the prompt without thinking - so the model can only go on with a call."""
+    TOOLS = [{"type": "function", "function": {"name": "search", "description": "search the web",
+                                               "parameters": {"type": "object",
+                                                              "properties": {"q": {"type": "string"}}}}},
+             {"type": "function", "function": {"name": "done", "parameters": {"type": "object", "properties": {}}}}]
+    NAMED = {"type": "function", "function": {"name": "search"}}
+    NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = CallingEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def openai(self, **extra):
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 400,
+                "tools": self.TOOLS, **extra}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read().decode()
+                return r.status, (json.loads(raw) if not body.get("stream") else raw)
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def call_of(self, code, b, stream):
+        """-> (finish_reason, [(name, arguments)], reasoning) of a whole or a streamed reply."""
+        self.assertEqual(code, 200, b)
+        if not stream:
+            choice = b["choices"][0]
+            calls = [(c["function"]["name"], json.loads(c["function"]["arguments"]))
+                     for c in choice["message"].get("tool_calls") or []]
+            return choice["finish_reason"], calls, choice["message"].get("reasoning_content") or ""
+        chunks = [json.loads(line[6:]) for line in b.splitlines() if line.startswith("data: {")]
+        names, args, reasoning, finish = {}, {}, "", None
+        for c in chunks:
+            d = c["choices"][0]["delta"]
+            reasoning += d.get("reasoning_content") or ""
+            for tc in d.get("tool_calls") or []:
+                names.setdefault(tc["index"], tc["function"].get("name"))
+                args[tc["index"]] = args.get(tc["index"], "") + tc["function"].get("arguments", "")
+            finish = c["choices"][0]["finish_reason"] or finish
+        return finish, [(names[i], json.loads(args[i])) for i in sorted(names)], reasoning
+
+    def test_required_and_named_after_the_thinking(self):
+        for choice in ("required", self.NAMED):
+            for stream in (False, True):
+                with self.subTest(choice=choice, stream=stream):
+                    self.engine.prompts = []
+                    code, b = self.openai(tool_choice=choice, stream=stream)
+                    finish, calls, reasoning = self.call_of(code, b, stream)
+                    self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
+                    self.assertEqual(reasoning, CallingEngine.THOUGHT)
+                    first, second = self.engine.prompts
+                    opening = "<tool_call>\n<function=" + ("search>\n" if choice == self.NAMED else "")
+                    # where the thinking ended, after the blank line the template puts before a call
+                    self.assertEqual(second, first + self.tok.encode(CallingEngine.THOUGHT + "</think>\n\n" + opening))
+
+    def test_without_thinking_the_prompt_ends_with_the_opening(self):
+        for choice in ("required", self.NAMED):
+            for stream in (False, True):
+                with self.subTest(choice=choice, stream=stream):
+                    self.engine.prompts = []
+                    code, b = self.openai(tool_choice=choice, stream=stream, **self.NO_THINKING)
+                    finish, calls, reasoning = self.call_of(code, b, stream)
+                    self.assertEqual((finish, calls, reasoning), ("tool_calls", [("search", {"q": "2+2"})], ""))
+                    self.assertEqual(len(self.engine.prompts), 1)
+                    opening = "<tool_call>\n<function=" + ("search>\n" if choice == self.NAMED else "")
+                    self.assertTrue(self.tok.decode(self.engine.prompts[0]).endswith("</think>\n\n" + opening))
+
+    def test_the_budget_wrap_up_opens_the_call(self):
+        from serve.server import REASONING_WRAP_UP
+        code, b = self.openai(tool_choice="required", reasoning_budget_tokens=20)
+        finish, calls, reasoning = self.call_of(code, b, False)
+        self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
+        self.assertEqual(reasoning, CallingEngine.THOUGHT[:20] + REASONING_WRAP_UP.split("</think>")[0])
+        first, second = self.engine.prompts
+        extra = self.tok.encode(REASONING_WRAP_UP + "<tool_call>\n<function=", parse_special=True)
+        self.assertEqual(second, first + self.tok.encode(CallingEngine.THOUGHT[:20]) + extra)
+
+    def test_auto_absent_and_none_leave_the_tools_to_the_model(self):
+        for extra in ({}, {"tool_choice": "auto"}, {"tool_choice": "none"}):
+            with self.subTest(extra=extra):
+                self.engine.prompts = []
+                code, b = self.openai(**extra)
+                self.assertEqual(code, 200, b)
+                self.assertEqual(b["choices"][0]["message"]["content"], CallingEngine.ANSWER)
+                self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+                self.assertEqual(len(self.engine.prompts), 1)
+                offered = "search the web" in self.tok.decode(self.engine.prompts[0])
+                self.assertEqual(offered, extra.get("tool_choice") != "none")   # "none": no tools in the prompt
+
+    def test_a_call_cut_by_max_tokens_is_not_a_tool_call(self):
+        code, b = self.openai(tool_choice="required", max_tokens=5, **self.NO_THINKING)
+        finish, calls, _ = self.call_of(code, b, False)
+        self.assertEqual((finish, calls), ("length", []))
+
+    def test_values_it_cannot_honour_act_as_auto(self):
+        """Not a 400: an odd tool_choice is logged and the model decides."""
+        named = lambda n: {"type": "function", "function": {"name": n}}  # noqa: E731
+        for choice, tools in ((named("nope"), self.TOOLS), ({"type": "function"}, self.TOOLS),
+                              ("required", None), ({"type": "banana"}, self.TOOLS), ("sometimes", self.TOOLS)):
+            with self.subTest(choice=choice, tools=bool(tools)):
+                self.engine.prompts = []
+                code, b = self.openai(tool_choice=choice, tools=tools)
+                self.assertEqual(code, 200, b)
+                self.assertEqual(b["choices"][0]["message"]["content"], CallingEngine.ANSWER)
+                self.assertEqual(len(self.engine.prompts), 1)
+
+    def test_the_flat_shape_names_a_function(self):
+        code, b = self.openai(tool_choice={"type": "function", "name": "search"})
+        finish, calls, _ = self.call_of(code, b, False)
+        self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
+
+    def test_server_forced_opening_after_unclosed_reasoning_quote(self):
+        from unittest import mock
+        for thought in ("``````xml\nexample\n", "``example\n"):
+            for budget in (0, 5):
+                with self.subTest(thought=thought, budget=budget), mock.patch.object(CallingEngine, "THOUGHT", thought):
+                    code, b = self.openai(tool_choice=self.NAMED, reasoning_budget_tokens=budget)
+                    finish, calls, _ = self.call_of(code, b, False)
+                    self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
+
+    def test_anthropic_any_tool_none(self):
+        tools = [{"name": "search", "description": "search the web", "input_schema": {
+            "type": "object", "properties": {"q": {"type": "string"}}}}, {"name": "done", "input_schema": {
+                "type": "object", "properties": {}}}]
+        for choice, want in (({"type": "any"}, "tool_use"), ({"type": "tool", "name": "search"}, "tool_use"),
+                             ({"type": "auto"}, "end_turn"), ({"type": "none"}, "end_turn"),
+                             ({"type": "tool", "name": "nope"}, "end_turn")):
+            for stream in (False, True):
+                with self.subTest(choice=choice, stream=stream):
+                    self.engine.prompts = []
+                    body = {"model": "m", "max_tokens": 400, "stream": stream, "tools": tools, "tool_choice": choice,
+                            "messages": [{"role": "user", "content": "2+2?"}]}
+                    req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps(body).encode(), headers={
+                        "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        raw = r.read().decode()
+                    if stream:
+                        evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+                        stop = [e for e in evs if e["type"] == "message_delta"][0]["delta"]["stop_reason"]
+                    else:
+                        stop = json.loads(raw)["stop_reason"]
+                    self.assertEqual(stop, want)
+                    offered = "search the web" in self.tok.decode(self.engine.prompts[0])
+                    self.assertEqual(offered, choice["type"] != "none")
+
+
 class StatusHandover(unittest.TestCase):
     """#266: a stream aborted mid-way and the next request, which was waiting for the fifo.  The aborted request's
     status/history block ran after the fifo was released, so the waiting request could start in that gap: the old
@@ -2679,6 +3004,47 @@ class LostStep(unittest.TestCase):
 
     def test_stop_never_acknowledged(self):
         self.run_mode("stop", stream=False)
+
+
+class ConnectionClose(unittest.TestCase):
+    """The server is HTTP/1.0 and closes the connection after every response; it says so (upstream a42a0c0)."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def headers(self, stream):
+        body = {"model": "x", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}], "stream": stream}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
+            return r.headers
+
+    def test_a_non_streamed_answer_says_the_connection_closes(self):
+        self.assertEqual(self.headers(stream=False).get("Connection"), "close")
+
+    def test_a_streamed_answer_says_the_connection_closes(self):
+        self.assertEqual(self.headers(stream=True).get("Connection"), "close")
+
+
+class ForcedCallOpening(unittest.TestCase):
+    """upstream 8e368af (#790): tool_choice "required" with a single tool names it."""
+    def test_required_with_one_tool_names_it(self):
+        from serve.frontend import forced_call
+        one, two = [{"name": "a"}], [{"name": "a"}, {"name": "b"}]
+        self.assertTrue(forced_call("required", one).endswith("<function=a>\n"))
+        self.assertTrue(forced_call("required", two).endswith("<function="))
+        self.assertIsNone(forced_call("auto", one))
 
 
 if __name__ == "__main__":
