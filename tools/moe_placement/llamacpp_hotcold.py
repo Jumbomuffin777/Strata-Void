@@ -24,13 +24,14 @@ from moe_placement import descriptor, stats  # noqa: E402
 from moe_placement.planner import parse_bytes  # noqa: E402
 
 
-def plan(d, s, devices: list, ram: int, ctx: int, kv_scale: float = 1.0):
+def plan(d, s, devices: list, ram: int, ctx: int, kv_scale: float = 1.0, no_split=()):
     """-> (cold {layer: [ids]}, layer counts per device, RAM bytes for the cold parts, cold activation share).
 
     Every contiguous split of the layers over the devices (in order) is considered: a device holds its layers' fixed
     bytes (dense, KV, one zero expert per MoE layer), then its layers' experts by measured activations per byte until
     its budget is full; the rest of its experts are cold. Dynamic programming picks the split with the fewest cold
-    activations, then the fewest cold bytes, that fits the RAM budget."""
+    activations, then the fewest cold bytes, that fits the RAM budget. Devices named in `no_split` keep their layers
+    whole (every expert in their memory, no hot/cold tensors): for backends that should not run the split path."""
     budgets = [b for _, b in devices]
     L = d.n_layers
     fixed = [d.dense_bytes[l] + d.kv_bytes_per_token[l] * ctx * kv_scale + d.state_bytes[l] +
@@ -39,6 +40,10 @@ def plan(d, s, devices: list, ram: int, ctx: int, kv_scale: float = 1.0):
 
     def device_cost(dev, i, j):
         """(cold activations, cold bytes, cold set) for layers [i, j) on device dev, or None if it cannot fit."""
+        if devices[dev][0] in no_split:
+            whole = sum(fixed[l] + (d.expert_bytes(l) * (d.n_expert - 1) if l in d.expert_tensors else 0)
+                        for l in range(i, j))
+            return (0, 0, {}) if whole <= budgets[dev] else None
         room = budgets[dev] - sum(fixed[i:j])
         if room < 0:
             return None
@@ -97,6 +102,7 @@ def main():
     ap.add_argument("--device", action="append", required=True, help="NAME=BUDGET in layer order, e.g. SYCL0=28.5GiB")
     ap.add_argument("--ram", required=True, help="host RAM budget for the cold parts")
     ap.add_argument("--ctx", type=int, required=True)
+    ap.add_argument("--no-split", action="append", default=[], help="device NAME whose layers stay whole (repeatable)")
     ap.add_argument("--kv-scale", type=float, default=1.0, help="KV bytes relative to the adapter's f16 estimate")
     ap.add_argument("--out-cold", required=True)
     a = ap.parse_args()
@@ -105,7 +111,7 @@ def main():
     for t in a.trace:
         s.merge(stats.read_strata_trace(t, d.n_layers, d.n_expert))
     devs = [(x.split("=")[0], parse_bytes(x.split("=")[1])) for x in a.device]
-    cold, counts, ram_b, share = plan(d, s, devs, parse_bytes(a.ram), a.ctx, a.kv_scale)
+    cold, counts, ram_b, share = plan(d, s, devs, parse_bytes(a.ram), a.ctx, a.kv_scale, set(a.no_split))
     Path(a.out_cold).write_text(json.dumps(cold))
     n_cold = sum(len(v) for v in cold.values())
     print(f"cold: {n_cold} experts in {len(cold)} layers, {ram_b / 2**30:.2f} GiB RAM, "

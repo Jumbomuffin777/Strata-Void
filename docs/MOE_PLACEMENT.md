@@ -198,13 +198,19 @@ the planner put 17.7 GiB of GLM's experts (3.0% of activations) and 14.8 GiB of 
 where previously whole layers had to sit on a remote CPU.
 
 Verified: the rewrite is byte-exact (unit test on a synthetic GGUF; 90 random expert slices per real model checked
-against the source); both rewritten models load on the patched build and produce coherent output with the hot parts
-on the GPUs and the cold parts on the CPU (tested with the remote layers on a CPU RPC worker: 6.1 tok/s GLM, 5.6 tok/s
-DeepSeek, single stream). **Not yet working:** with the remote layers on CUDA RPC workers the worker aborted on the
-first request in repeated runs (the ops the patch adds were probed individually on those workers and pass; the cause is
-not identified, a compute-buffer out-of-memory on the smallest card is the leading suspect). The unpatched build's RPC
-workers also dropped intermittently under sustained load, so the RPC link itself needs to be stable before a speed
-comparison is meaningful. No speedup is claimed yet.
+against the source), and both rewritten models give correct, coherent output. Measured single-stream decode on a host
+with three Intel Arc Pro GPUs plus two CUDA GPUs over llama.cpp RPC (64K context, q8 KV, greedy prompts):
+
+| | previous layout (whole layers on a remote CPU) | hot/cold, CUDA layers kept whole | |
+|---|---|---|---|
+| GLM-5.3-Flash UD-IQ3_XXS | 6.9 tok/s | **9.4-9.9 tok/s** (prompt 37 tok/s at 3K) | 19.8 GiB cold, 5.4% of activations |
+| DeepSeek V4 Flash UD-IQ3_S | 6.1 tok/s | **7.0 tok/s** | 16.2 GiB cold, 2.4% of activations |
+
+**Known limitation:** layers split into hot/cold parts crash llama.cpp's CUDA RPC workers on the first request (the
+added ops pass individually on those workers; the cause is open). `llamacpp_hotcold.py --no-split DEVICE` keeps a
+device's layers whole, which is how the numbers above were measured: split layers run on the SYCL GPUs and the CPU,
+the CUDA devices hold complete layers. With every layer split and the remote layers on a CPU RPC worker instead, the
+models also run correctly (6.1 / 5.6 tok/s on that slower layout).
 
 Cost to know about: the cold part runs in every split layer even when no cold expert is selected (its zero expert is
 read: one expert's bytes per layer per token). Avoiding that needs a runtime skip in the backend's `mul_mat_id`.
