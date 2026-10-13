@@ -86,7 +86,11 @@ BUILD="$DIR/build"
 if [ "$SYCL" = 1 ]; then
   if ! command -v icpx >/dev/null; then
     # shellcheck disable=SC1091
-    [ -f /opt/intel/oneapi/setvars.sh ] && source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+    if [ -f /opt/intel/oneapi/setvars.sh ]; then
+      set +u                                   # setvars.sh reads unset variables: with -u the script would end
+      source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+      set -u
+    fi
   fi
   command -v icpx >/dev/null || die "SYCL needs the oneAPI compilers (icx/icpx): install oneAPI and run
   'source /opt/intel/oneapi/setvars.sh', or build with --cpu"
