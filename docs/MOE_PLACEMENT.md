@@ -173,15 +173,49 @@ after GPU 0's over `--expert-cache-device1..3` its own way (striped or by layer)
 is a suggestion there. Cluster specs: [examples/moe-maps/cluster.example.json](../examples/moe-maps/cluster.example.json)
 (sizes accept `"32GiB"`, `"64GB"` or bytes; bandwidths are GB/s).
 
+## Running it today: hot/cold experts in llama.cpp
+
+Native Strata cannot run GLM-5.3 or DeepSeek V4 yet (below), but llama.cpp can, and the same idea applies there:
+keep the experts the router actually uses on the GPUs and the rarely used ones in host RAM. Stock llama.cpp places
+a layer's experts as ONE tensor, so it can only move whole layers. Four pieces add per-expert placement:
+
+| piece | what it does |
+|---|---|
+| `tools/llamacpp/routing-dump.cpp` | runs a model over a text file with an eval callback on `ffn_moe_topk-<layer>` and writes the selected ids per token (the trace `stats.py` reads); text is never recorded |
+| `tools/moe_placement/llamacpp_hotcold.py` | for every contiguous split of layers over the GPUs (llama.cpp's `--split-mode layer`), fills each GPU with its own layers' most-routed experts and leaves the rest cold; dynamic programming picks the split with the fewest cold activations that fits the RAM budget; prints `--tensor-split`, `-ot` and the cold list |
+| `tools/moe_placement/gguf_hotcold.py` | rewrites the GGUF: each split layer's `ffn_*_exps` become `_hot` and `_cold` tensors (each ending in one all-zero expert) plus two I32 id tables; everything else is copied byte for byte |
+| `patches/llama.cpp-moe-hot-cold-experts.patch` | `build_moe_ffn` looks each canonical id up in both tables; the part that does not hold an expert computes its zero expert (output exactly 0); hot + cold is added before the usual weighting. Original GGUFs are unaffected |
+
+Measured routing (llama.cpp, a 16-31K-token mix of source code, operations documents and multilingual prose):
+
+| | experts per layer | top 50% carry | top 70% | top 85% | top 90% |
+|---|---|---|---|---|---|
+| GLM-5.3-Flash UD-IQ3_XXS (42 routed layers) | 288, top-8 | 75.4% | 89.1% | 96.2% (worst layer 89.5%) | 97.9% |
+| DeepSeek V4 Flash UD-IQ3_S (43 layers) | 256, top-6 | 80.9% | 92.4% | 97.6% (hash layers 0-2: ~91%) | 98.8% |
+
+The skew is what makes this pay: on a host with three Intel Arc Pro GPUs (88 GB) plus two GPUs on a second host,
+the planner put 17.7 GiB of GLM's experts (3.0% of activations) and 14.8 GiB of DeepSeek's (1.8%) in host RAM,
+where previously whole layers had to sit on a remote CPU.
+
+Verified: the rewrite is byte-exact (unit test on a synthetic GGUF; 90 random expert slices per real model checked
+against the source); both rewritten models load on the patched build and produce coherent output with the hot parts
+on the GPUs and the cold parts on the CPU (tested with the remote layers on a CPU RPC worker: 6.1 tok/s GLM, 5.6 tok/s
+DeepSeek, single stream). **Not yet working:** with the remote layers on CUDA RPC workers the worker aborted on the
+first request in repeated runs (the ops the patch adds were probed individually on those workers and pass; the cause is
+not identified, a compute-buffer out-of-memory on the smallest card is the leading suspect). The unpatched build's RPC
+workers also dropped intermittently under sustained load, so the RPC link itself needs to be stable before a speed
+comparison is meaningful. No speedup is claimed yet.
+
+Cost to know about: the cold part runs in every split layer even when no cold expert is selected (its zero expert is
+read: one expert's bytes per layer per token). Avoiding that needs a runtime skip in the backend's `mul_mat_id`.
+
 ## What is missing for real GLM / DeepSeek inference
 
 In order, each a prerequisite of the next:
 
-1. **Routing statistics.** None exist for either model: Strata cannot run them, and llama.cpp has no built-in routing dump.
-   Plans for them today use `--allow-unmeasured`, which ranks nothing. Next step: a routing dump from the llama.cpp
-   build behind the existing profiles (a graph callback on the `ffn_moe_topk` tensor writing the format
-   `stats.read_strata_trace` reads), run on representative text. DeepSeek's hash-routed layers 0-2 need text
-   matching the deployment's token distribution.
+1. **Routing statistics.** Now measured for both models with `tools/llamacpp/routing-dump.cpp` (above). They come from
+   llama.cpp on a code/docs/prose mix; a deployment should re-measure on its own traffic, and DeepSeek's hash-routed
+   layers 0-2 follow the token distribution of whatever text is used.
 2. **Engine layers.** Strata's geometry is fixed (`include/strata/core/layout.hpp`, `include/strata/plan/plan.hpp`:
    48 x 512, GDN + QSA). GLM needs KDA linear attention, MLA with an indexer, 4-way hyper-connections, sigmoid
    routing with bias, 288 experts; DeepSeek V4 needs compressed sparse attention with an indexer, hash routing,

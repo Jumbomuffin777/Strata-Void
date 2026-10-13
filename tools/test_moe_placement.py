@@ -45,8 +45,8 @@ def _kv(k, v) -> bytes:
     raise TypeError(v)
 
 
-def write_gguf(path, meta: dict, tensors: list, align: int = 32) -> None:
-    """tensors: [(name, shape, type_id)]. The data region is zeros (a sparse file)."""
+def write_gguf(path, meta: dict, tensors: list, align: int = 32, fill: bool = False) -> None:
+    """tensors: [(name, shape, type_id)]. The data region is zeros (a sparse file), or random bytes with `fill`."""
     offs, pos = [], 0
     for _, shape, t in tensors:
         offs.append(pos)
@@ -61,6 +61,8 @@ def write_gguf(path, meta: dict, tensors: list, align: int = 32) -> None:
     out += b"\0" * ((-len(out)) % align)
     with open(path, "wb") as f:
         f.write(out)
+        if fill:
+            f.write(random.Random(path.name).randbytes(pos))
         f.truncate(len(out) + pos)
 
 
@@ -484,6 +486,51 @@ class TestStrpExport(Base):
         ref = self.dir / "ref.bin"
         make_profile.write_profile(ref, ranked, 512)
         self.assertEqual(out.read_bytes(), ref.read_bytes())       # byte for byte what --expert-profile reads
+
+
+# ------------------------------------------------------------------------------------ hot/cold GGUF rewrite
+class TestHotColdRewrite(Base):
+    def test_rewrite_is_exact(self):
+        from moe_placement import gguf_hotcold
+        from gguf_reader import GGUFFile
+        meta, t = glm_like()
+        src = self.dir / "src.gguf"
+        write_gguf(src, meta, t, fill=True)
+        cold = {"1": [3, 0, 15], "3": list(range(8, 16)), "4": [7]}       # layer 2 stays all-hot
+        dst = self.dir / "hc.gguf"
+        gguf_hotcold.write(src, cold, dst, progress=None)
+        a, b = GGUFFile(src), GGUFFile(dst)
+        self.assertEqual(a.metadata, b.metadata)
+        ra, rb = src.read_bytes(), dst.read_bytes()
+        ta = {x.name: x for x in a.tensors}
+        tb = {x.name: x for x in b.tensors}
+
+        def data(g, raw, x):
+            return raw[g.data_start + x.offset: g.data_start + x.offset + descriptor.tensor_bytes(x.type_name, x.shape)
+                       if x.type_name != "I32" else g.data_start + x.offset + 4 * math.prod(x.shape)]
+        for name, x in ta.items():
+            if name in tb:
+                self.assertEqual(data(a, ra, x), data(b, rb, tb[name]), name)
+        for layer, c in cold.items():
+            self.assertNotIn(f"blk.{layer}.ffn_gate_exps.weight", tb)
+            hot = [e for e in range(16) if e not in c]
+            mh = struct.unpack("<16i", data(b, rb, tb[f"blk.{layer}.ffn_exps_map_hot.weight"]))
+            mc = struct.unpack("<16i", data(b, rb, tb[f"blk.{layer}.ffn_exps_map_cold.weight"]))
+            for role in ("gate", "up", "down"):
+                orig = data(a, ra, ta[f"blk.{layer}.ffn_{role}_exps.weight"])
+                sb = len(orig) // 16
+                parts = {p: data(b, rb, tb[f"blk.{layer}.ffn_{role}_exps_{p}.weight"]) for p in ("hot", "cold")}
+                self.assertEqual(len(parts["hot"]), sb * (len(hot) + 1))
+                self.assertEqual(parts["hot"][-sb:], bytes(sb))
+                self.assertEqual(parts["cold"][-sb:], bytes(sb))
+                for e in range(16):                       # every canonical expert is found exactly where its map says
+                    p, m, n = ("hot", mh, len(hot)) if e in hot else ("cold", mc, len(c))
+                    self.assertEqual(parts[p][m[e] * sb:(m[e] + 1) * sb], orig[e * sb:(e + 1) * sb])
+                    other = mc if p == "hot" else mh
+                    self.assertEqual(other[e], len(c) if p == "hot" else len(hot))   # -> the other part's zero expert
+        self.assertIn("blk.2.ffn_gate_exps.weight", tb)
+        d = descriptor.describe([dst], allow_generic=True)        # still a well-formed GGUF
+        self.assertEqual(d[0].architecture, "glm5next")
 
 
 # ------------------------------------------------------------------------------------ the shipped example

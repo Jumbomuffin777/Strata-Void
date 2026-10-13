@@ -11,7 +11,8 @@ Strata Void's version numbers are its own, independent of upstream's engine vers
 **MoE expert placement maps (tooling; no engine change)**
 
 - `tools/moe_placement/` + `tools/moe_place.py`: header-only adapters for `qwen4exp`, `glm5next` (GLM-5.3-Flash) and `deepseek4` (DeepSeek V4 Flash); a versioned, fingerprinted map format (`strata.moe-map` v1) with import validation; a planner that ranks experts by measured routing frequency under explicit VRAM, KV, state and bounded-RAM budgets; a canonical-id lookup whose reordering is tested bit-exact; STRP export for `--expert-profile` (`qwen4exp` only).
-- GLM and DeepSeek are planned, not run: the engine has no layers for them and the exporter refuses. No routing statistics exist for them yet. See [MOE_PLACEMENT](docs/MOE_PLACEMENT.md).
+- GLM and DeepSeek are planned, not run natively: the engine has no layers for them and the STRP exporter refuses. See [MOE_PLACEMENT](docs/MOE_PLACEMENT.md).
+- Hot/cold experts for llama.cpp: `tools/llamacpp/routing-dump.cpp` (measured routing: the top 85% of experts carry 96.2% of GLM-5.3-Flash's and 97.6% of DeepSeek V4 Flash's activations), `llamacpp_hotcold.py` (per-GPU placement by dynamic programming), `gguf_hotcold.py` (byte-exact GGUF rewrite) and `patches/llama.cpp-moe-hot-cold-experts.patch`. Both models run coherently with cold experts on the CPU; with CUDA RPC workers the worker aborts on the first request (cause open), so no speedup is claimed.
 
 ## void-v0.1.1 (2026-10-11)
 
