@@ -17,6 +17,9 @@ source /opt/intel/oneapi/setvars.sh
 | `strata-void-128k.json` | 128K | 8-bit | 4 / 2 | full (128K) | `18,36` | 64K and 120K documents |
 | `strata-void-128k-slots16k.json` | 128K | 8-bit | 6 / 3 | `--slot-context 16384` | `18,36` | the context-ceiling probe: one long request plus six 16K slots |
 
+[llamacpp-hotcold/](llamacpp-hotcold/) holds configs for the llama.cpp engine (`--engine llamacpp`): hot/cold MoE
+GGUFs such as GLM-5.3-Flash and DeepSeek V4 Flash, see [docs/HOTCOLD_LLAMACPP.md](../docs/HOTCOLD_LLAMACPP.md).
+
 Task-Parallel Requests need **full-size slots** to share a long document between their steps (every step restores
 the planner's read of it). With `--slot-context` the slots are smaller: shorter requests still use them, and a
 document larger than a slot is cut into slices instead (slower; see [docs/TASK_PARALLEL.md](../docs/TASK_PARALLEL.md)).

@@ -6,6 +6,22 @@ Strata Void's own releases. Upstream Strata's changes are in its history and
 Strata Void's version numbers are its own, independent of upstream's engine versions (0.1.x). Its tags are named
 `void-vX.Y.Z` so they never collide with upstream's `vX.Y.Z` tags.
 
+## Unreleased
+
+**MoE expert placement maps (tooling; no engine change)**
+
+- `tools/moe_placement/` + `tools/moe_place.py`: header-only adapters for `qwen4exp`, `glm5next` (GLM-5.3-Flash) and `deepseek4` (DeepSeek V4 Flash); a versioned, fingerprinted map format (`strata.moe-map` v1) with import validation; a planner that ranks experts by measured routing frequency under explicit VRAM, KV, state and bounded-RAM budgets; a canonical-id lookup whose reordering is tested bit-exact; STRP export for `--expert-profile` (`qwen4exp` only).
+- GLM and DeepSeek are planned, not run natively: the engine has no layers for them and the STRP exporter refuses. See [MOE_PLACEMENT](docs/MOE_PLACEMENT.md).
+- Hot/cold on CUDA: split layers on CUDA get one zero expert per routing slot (`gguf_hotcold.py --slot-zeros`, planner `--slot-zeros DEVICE`), the cause of the CUDA RPC worker crash (duplicate expert ids per token); verified with synthetic tests at real shapes on a CUDA RPC worker, not yet with a full model. Hot/cold GGUFs need `--no-op-offload`.
+
+**The llama.cpp hot/cold backend as part of Strata Void**
+
+- `serve/llamacpp.py`, `python -m serve.server --engine llamacpp --config ...`: serves a GGUF through a patched `llama-server` child on a private loopback port with its own key: start on demand, wait for the model, restart after a crash, idle unload, load gates (`min_free_ram_mib`, `before_load`); OpenAI and Anthropic requests passed through whole or streamed (a client that leaves cancels its request); Task-Parallel Requests through `LlamaCppBackend`, the orchestrator's existing `Backend` protocol. A hot/cold GGUF is detected from its header and gets `--no-op-offload`. The native Strata engine is unchanged; `serve/server.py` only dispatches to it.
+- `tools/llamacpp/build_hotcold.sh`: clones llama.cpp at the pinned commit, applies the patch (stops with the reason if it does not apply), builds `llama-server`, `ggml-rpc-server` and `routing-dump` with SYCL + RPC, CUDA optional (`--cuda`), CPU-only (`--cpu`).
+- [docs/HOTCOLD_LLAMACPP.md](docs/HOTCOLD_LLAMACPP.md): one flow, routing dump -> plan -> rewrite -> build -> serve; generic configs in `examples/llamacpp-hotcold/`.
+- `serve/test_llamacpp.py` (36 tests, in CI) against `serve/llamacpp_fake_server.py`, a stand-in llama-server process; no GPU, model or llama.cpp build. Also checked by hand against the real patched `llama-server` (CPU build, a small dense model): passthrough, streaming, Task-Parallel synthesis and sections, cancellation, restart after a killed server, a stop that ends running requests at once.
+- Hot/cold experts for llama.cpp: `tools/llamacpp/routing-dump.cpp` (measured routing: the top 85% of experts carry 96.2% of GLM-5.3-Flash's and 97.6% of DeepSeek V4 Flash's activations), `llamacpp_hotcold.py` (per-GPU placement by dynamic programming), `gguf_hotcold.py` (byte-exact GGUF rewrite) and `patches/llama.cpp-moe-hot-cold-experts.patch`. Measured with split layers on SYCL GPUs + CPU and CUDA RPC layers kept whole (`--no-split`): GLM 6.9 -> 9.4-9.9 tok/s, DeepSeek 6.1 -> 7.0 tok/s, coherent output, 11-19K-token prompts read.
+
 ## void-v0.1.1 (2026-10-11)
 
 **Server protocol fixes, not a new SYCL kernel optimization**

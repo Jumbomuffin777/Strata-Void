@@ -4334,7 +4334,9 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
+    ap.add_argument("--engine", choices=["mock", "strata", "llamacpp"], default="mock",
+                    help="strata: the native engine; llamacpp: a GGUF through llama.cpp's llama-server (e.g. a hot/cold "
+                         "MoE GGUF, docs/MOE_PLACEMENT.md; serve/llamacpp.py)")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
@@ -4380,6 +4382,11 @@ def main() -> int:
     except OSError:
         ap.error(f"port {a.port} is already in use - is Strata (or another server) already running? "
                  f"Close it, or start this one with a different --port")
+    if a.engine == "llamacpp":                          # serve/llamacpp.py: llama-server owns tokenizer and template
+        if not cfg:
+            ap.error("--engine llamacpp needs --config")
+        from serve import llamacpp
+        return llamacpp.run(a, cfg, sys.modules[__name__])
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()

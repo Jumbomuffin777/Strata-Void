@@ -25,6 +25,8 @@ flowchart LR
 | Engine (SYCL) | `sycl/src/program/generate.cpp`, `sycl/src/core/verify.cpp` | `ckpt=N` (checkpoint a shared prefix, restore it into another slot), `--slot-context N`, batch slots in pipelined groups across a layer split (port of upstream #465), per-stage expert residency |
 | Kernels (SYCL) | `sycl/src/kernels/cuda/iq_kernels.dp.cpp` | IQ4_XS / IQ4_NL → FP16 dequant for the prompt path (`STRATA_DQ_FAST`, on by default, bit-identical) |
 | Tools | `tools/task_parallel_bench.py`, `task_parallel_score.py`, `task_parallel_report.py`, `longctx_tasks.py`, `sycl/src/kernels/moe_prefill_bench.cpp` | the benchmark runner, scorer, report, seeded long-document tasks, a prompt-path microbenchmark |
+| llama.cpp engine | `serve/llamacpp.py`, `tools/llamacpp/build_hotcold.sh` | `--engine llamacpp`: a GGUF (e.g. a hot/cold MoE one) served by a patched llama-server child process - lifecycle and health, OpenAI/Anthropic passthrough, Task-Parallel Requests through `LlamaCppBackend` ([HOTCOLD_LLAMACPP.md](HOTCOLD_LLAMACPP.md)); the native engine is not involved |
+| Placement (tools) | `tools/moe_placement/`, `tools/moe_place.py` | MoE expert placement maps: architecture adapters from GGUF headers, a measured-frequency cost model under VRAM/RAM/KV budgets, a versioned shareable map, STRP export for the engine ([MOE_PLACEMENT.md](MOE_PLACEMENT.md)) |
 | Tests | `serve/test_task_parallel.py`, `serve/test_task_parallel_v2.py`, `serve/test_parallel.py`, `sycl/tests/*` | the orchestration against a fake backend (no GPU), the server's slot handling, engine helpers |
 
 ## The orchestrator is engine-agnostic
@@ -41,8 +43,10 @@ class Backend(Protocol):
 
 plus two optional ones (`slot_context()`, `busy()`). It never touches GPUs, KV caches or engine builds: a subtask is
 an ordinary request with its own messages, budget and thinking setting. Any engine behind `serve/server.py` that
-runs requests concurrently (upstream's CUDA/HIP `--batch N` as well as this fork's SYCL engine) can serve it. The
-tests run it against a scripted fake backend.
+runs requests concurrently (upstream's CUDA/HIP `--batch N` as well as this fork's SYCL engine) can serve it, and so
+can llama.cpp's llama-server with `--parallel N` (`LlamaCppBackend`, `serve/llamacpp.py`: an internal request is a
+streamed chat completion in one of its slots). The tests run it against a scripted fake backend and a fake
+llama-server.
 
 ## One request, step by step
 

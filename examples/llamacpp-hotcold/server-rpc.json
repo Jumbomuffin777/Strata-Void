@@ -1,0 +1,21 @@
+{
+  "exe": "third_party/llama.cpp-hotcold/build/bin/llama-server",
+  "model": "models/MODEL-hotcold.gguf",
+  "model_name": "deepseek-v4-flash-hotcold",
+  "args": [
+    "--ctx-size", "65536", "--parallel", "1",
+    "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--flash-attn", "on",
+    "--jinja", "--no-webui",
+    "--rpc", "RPC_HOST:50052",
+    "--device", "SYCL0,SYCL1,SYCL2,RPC0", "--split-mode", "layer", "--tensor-split", "13,14,10,6",
+    "--n-gpu-layers", "all",
+    "-ot", "ffn_.*_exps_cold\\.=CPU",
+    "--no-op-offload"
+  ],
+  "hotcold": "auto",
+  "log": "llama-server-hotcold.log",
+  "start_timeout_s": 1800,
+  "min_free_ram_mib": 20480,
+  "lazy_load": true,
+  "idle_unload_s": 1800
+}
