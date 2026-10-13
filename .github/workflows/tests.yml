@@ -37,6 +37,10 @@ jobs:
         run: python tools/test_setup_sycl.py
       - name: MoE placement maps
         run: python tools/test_moe_placement.py -v
+      - name: llama.cpp engine (hot/cold GGUFs) against a fake llama-server
+        run: |
+          bash -n tools/llamacpp/build_hotcold.sh
+          python -m unittest serve.test_llamacpp -v
       - name: Example configs parse
         run: |
           python - <<'PY'

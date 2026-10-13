@@ -1,0 +1,21 @@
+{
+  "exe": "third_party/llama.cpp-hotcold/build/bin/llama-server",
+  "model": "models/MODEL-hotcold.gguf",
+  "model_name": "glm-5.3-flash-hotcold",
+  "args": [
+    "--ctx-size", "65536", "--parallel", "2",
+    "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--flash-attn", "on",
+    "--jinja", "--no-webui",
+    "--device", "SYCL0,SYCL1,SYCL2", "--split-mode", "layer", "--tensor-split", "15,14,12",
+    "--n-gpu-layers", "all",
+    "-ot", "ffn_.*_exps_cold\\.=CPU",
+    "--no-op-offload"
+  ],
+  "env": {"ZES_ENABLE_SYSMAN": "1", "UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS": "1"},
+  "hotcold": "auto",
+  "log": "llama-server-hotcold.log",
+  "start_timeout_s": 1800,
+  "min_free_ram_mib": 24576,
+  "idle_unload_s": 0,
+  "task_parallel": {"max_workers": 2}
+}

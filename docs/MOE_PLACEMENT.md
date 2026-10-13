@@ -206,11 +206,18 @@ with three Intel Arc Pro GPUs plus two CUDA GPUs over llama.cpp RPC (64K context
 | GLM-5.3-Flash UD-IQ3_XXS | 6.9 tok/s | **9.4-9.9 tok/s** (prompt 37 tok/s at 3K) | 19.8 GiB cold, 5.4% of activations |
 | DeepSeek V4 Flash UD-IQ3_S | 6.1 tok/s | **7.0 tok/s** | 16.2 GiB cold, 2.4% of activations |
 
-**Known limitation:** layers split into hot/cold parts crash llama.cpp's CUDA RPC workers on the first request (the
-added ops pass individually on those workers; the cause is open). `llamacpp_hotcold.py --no-split DEVICE` keeps a
-device's layers whole, which is how the numbers above were measured: split layers run on the SYCL GPUs and the CPU,
-the CUDA devices hold complete layers. With every layer split and the remote layers on a CPU RPC worker instead, the
-models also run correctly (6.1 / 5.6 tok/s on that slower layout).
+**CUDA:** layers split into hot/cold parts first crashed llama.cpp's CUDA RPC workers (illegal memory access). The
+cause: with one shared zero expert, a token could select the same id twice, and CUDA's `mul_mat_id` groups tokens by
+expert assuming distinct ids. Layers placed on CUDA now get one zero expert per routing slot
+(`gguf_hotcold.py --slot-zeros`, planner `--slot-zeros DEVICE`), which passes synthetic tests at real shapes on a CUDA
+RPC worker; a full model with split layers on CUDA is not yet measured end to end. The numbers above keep the CUDA
+devices' layers whole (`llamacpp_hotcold.py --no-split DEVICE`): split layers run on the SYCL GPUs and the CPU. With
+every layer split and the remote layers on a CPU RPC worker instead, the models also run correctly (6.1 / 5.6 tok/s on
+that slower layout). Run hot/cold GGUFs with `--no-op-offload`: op offload reads expert ids before the split computes
+them.
+
+**Serving it:** the whole flow (build, routing dump, plan, rewrite, serve through Strata Void's `--engine llamacpp`,
+Task-Parallel Requests included) is in [HOTCOLD_LLAMACPP.md](HOTCOLD_LLAMACPP.md).
 
 Cost to know about: the cold part runs in every split layer even when no cold expert is selected (its zero expert is
 read: one expert's bytes per layer per token). Avoiding that needs a runtime skip in the backend's `mul_mat_id`.
