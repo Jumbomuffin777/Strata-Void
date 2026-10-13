@@ -1,0 +1,31 @@
+{
+  "format": "strata.moe-cluster",
+  "version": 1,
+  "context_tokens": 32768,
+  "sequences": 1,
+  "hop_us": 10,
+  "dense_split": "auto",
+  "hosts": [
+    {
+      "name": "engine-host",
+      "ram_bytes": "64GB",
+      "ram_reserve_bytes": "12GB",
+      "cpu_expert_GBps": 35,
+      "devices": [
+        {"name": "gpu0", "vram_bytes": "32GiB", "reserve_bytes": "1.5GiB", "mem_GBps": 500, "link_GBps": 16},
+        {"name": "gpu1", "vram_bytes": "24GiB", "reserve_bytes": "1.5GiB", "mem_GBps": 450, "link_GBps": 16}
+      ]
+    },
+    {
+      "name": "helper-host",
+      "ram_bytes": "64GB",
+      "cpu_expert_GBps": 40,
+      "devices": [
+        {"name": "helper-gpu0", "vram_bytes": "24GiB", "reserve_bytes": "2GiB", "mem_GBps": 900}
+      ]
+    }
+  ],
+  "links": [
+    {"hosts": ["engine-host", "helper-host"], "GBps": 0.6, "rtt_us": 150, "transport": "llama.cpp-rpc"}
+  ]
+}

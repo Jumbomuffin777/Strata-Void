@@ -6,6 +6,13 @@ Strata Void's own releases. Upstream Strata's changes are in its history and
 Strata Void's version numbers are its own, independent of upstream's engine versions (0.1.x). Its tags are named
 `void-vX.Y.Z` so they never collide with upstream's `vX.Y.Z` tags.
 
+## Unreleased
+
+**MoE expert placement maps (tooling; no engine change)**
+
+- `tools/moe_placement/` + `tools/moe_place.py`: header-only adapters for `qwen4exp`, `glm5next` (GLM-5.3-Flash) and `deepseek4` (DeepSeek V4 Flash); a versioned, fingerprinted map format (`strata.moe-map` v1) with import validation; a planner that ranks experts by measured routing frequency under explicit VRAM, KV, state and bounded-RAM budgets; a canonical-id lookup whose reordering is tested bit-exact; STRP export for `--expert-profile` (`qwen4exp` only).
+- GLM and DeepSeek are planned, not run: the engine has no layers for them and the exporter refuses. No routing statistics exist for them yet. See [MOE_PLACEMENT](docs/MOE_PLACEMENT.md).
+
 ## void-v0.1.1 (2026-10-11)
 
 **Server protocol fixes, not a new SYCL kernel optimization**
