@@ -24,7 +24,7 @@ from moe_placement import descriptor, stats  # noqa: E402
 from moe_placement.planner import parse_bytes  # noqa: E402
 
 
-def plan(d, s, devices: list, ram: int, ctx: int, kv_scale: float = 1.0, no_split=()):
+def plan(d, s, devices: list, ram: int, ctx: int, kv_scale: float = 1.0, no_split=(), slot_zeros=()):
     """-> (cold {layer: [ids]}, layer counts per device, RAM bytes for the cold parts, cold activation share).
 
     Every contiguous split of the layers over the devices (in order) is considered: a device holds its layers' fixed
@@ -45,6 +45,8 @@ def plan(d, s, devices: list, ram: int, ctx: int, kv_scale: float = 1.0, no_spli
                         for l in range(i, j))
             return (0, 0, {}) if whole <= budgets[dev] else None
         room = budgets[dev] - sum(fixed[i:j])
+        if devices[dev][0] in slot_zeros:          # CUDA: one zero expert per routing slot instead of one in total
+            room -= sum(d.expert_bytes(l) * (max(d.n_expert_used, 1) - 1) for l in range(i, j) if l in d.expert_tensors)
         if room < 0:
             return None
         items = sorted(((-cnt[l][e] / d.expert_bytes(l), l, e) for l in range(i, j) if l in cnt
@@ -103,6 +105,8 @@ def main():
     ap.add_argument("--ram", required=True, help="host RAM budget for the cold parts")
     ap.add_argument("--ctx", type=int, required=True)
     ap.add_argument("--no-split", action="append", default=[], help="device NAME whose layers stay whole (repeatable)")
+    ap.add_argument("--slot-zeros", action="append", default=[],
+                    help="device NAME running CUDA: its split layers get one zero expert per routing slot (repeatable)")
     ap.add_argument("--kv-scale", type=float, default=1.0, help="KV bytes relative to the adapter's f16 estimate")
     ap.add_argument("--out-cold", required=True)
     a = ap.parse_args()
@@ -111,13 +115,20 @@ def main():
     for t in a.trace:
         s.merge(stats.read_strata_trace(t, d.n_layers, d.n_expert))
     devs = [(x.split("=")[0], parse_bytes(x.split("=")[1])) for x in a.device]
-    cold, counts, ram_b, share = plan(d, s, devs, parse_bytes(a.ram), a.ctx, a.kv_scale, set(a.no_split))
+    cold, counts, ram_b, share = plan(d, s, devs, parse_bytes(a.ram), a.ctx, a.kv_scale, set(a.no_split), set(a.slot_zeros))
     Path(a.out_cold).write_text(json.dumps(cold))
     n_cold = sum(len(v) for v in cold.values())
     print(f"cold: {n_cold} experts in {len(cold)} layers, {ram_b / 2**30:.2f} GiB RAM, "
           f"{share:.1%} of measured activations")
     print(" ".join(split_args([n for n, _ in devs], counts)))
     print("layers per device:", dict(zip((n for n, _ in devs), counts)))
+    first, sz = 0, []
+    for (n, _), c in zip(devs, counts):
+        if n in a.slot_zeros and c:
+            sz += [l for l in range(first, first + c) if str(l) in cold]
+        first += c
+    if sz:
+        print(f"rewrite with: --slot-zeros {min(sz)}-{max(sz)}")
 
 
 def split_args(names: list, counts: list) -> list:

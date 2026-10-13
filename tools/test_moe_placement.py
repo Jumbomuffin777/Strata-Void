@@ -8,6 +8,7 @@ the adapters see exactly the structure a real file has.
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import math
 import random
@@ -531,6 +532,40 @@ class TestHotColdRewrite(Base):
         self.assertIn("blk.2.ffn_gate_exps.weight", tb)
         d = descriptor.describe([dst], allow_generic=True)        # still a well-formed GGUF
         self.assertEqual(d[0].architecture, "glm5next")
+
+
+    def test_per_slot_zero_experts_give_distinct_ids(self):
+        """CUDA layers: absent experts go to zero expert `slot`, so no token repeats a hot id."""
+        from moe_placement import gguf_hotcold
+        from gguf_reader import GGUFFile
+        meta, t = glm_like()
+        src = self.dir / "src.gguf"
+        write_gguf(src, meta, t, fill=True)
+        cold = {"1": [3, 0, 15, 9], "2": [1, 2]}
+        dst = self.dir / "slots.gguf"
+        gguf_hotcold.write(src, cold, dst, progress=None, slot_zero_layers={1})
+        b = GGUFFile(dst)
+        rb = dst.read_bytes()
+        tb = {x.name: x for x in b.tensors}
+        k = 2                                                       # glm_like: expert_used_count = 2
+        self.assertEqual(tb["blk.1.ffn_exps_map_hot.weight"].shape, [1, 16, k])
+        self.assertEqual(tb["blk.1.ffn_gate_exps_hot.weight"].shape[-1], 16 - 4 + k)
+        self.assertEqual(tb["blk.1.ffn_exps_map_cold.weight"].shape, [1, 16])   # cold (CPU) keeps one zero expert
+        self.assertEqual(tb["blk.2.ffn_exps_map_hot.weight"].shape, [1, 16])    # non-CUDA layer unchanged
+        x = tb["blk.1.ffn_exps_map_hot.weight"]
+        raw = rb[b.data_start + x.offset: b.data_start + x.offset + 4 * 16 * k]
+        table = [struct.unpack_from("<16i", raw, 64 * j) for j in range(k)]   # table[slot][expert]
+        n_hot = 12
+        for sel in itertools.combinations(range(16), k):       # every distinct top-k a router can produce
+            for order in itertools.permutations(sel):
+                ids = [table[j][e] for j, e in enumerate(order)]
+                self.assertEqual(len(set(ids)), k, (order, ids))
+                for j, e in enumerate(order):
+                    self.assertEqual(ids[j] == n_hot + j, e in cold["1"])
+        g = tb["blk.1.ffn_gate_exps_hot.weight"]
+        sb = descriptor.tensor_bytes(g.type_name, g.shape[:-1])
+        zeros = rb[b.data_start + g.offset + n_hot * sb: b.data_start + g.offset + (n_hot + k) * sb]
+        self.assertEqual(zeros, bytes(k * sb))
 
 
 # ------------------------------------------------------------------------------------ the shipped example

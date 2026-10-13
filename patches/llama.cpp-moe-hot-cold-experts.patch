@@ -9,10 +9,15 @@ layer's routed experts are computed in two parts: the hot part follows the layer
 selected id goes through I32 lookup tables to an index in each part, the part that does not hold it uses its all-zero
 expert, and hot + cold is added before the usual weighting. Original GGUFs load and run exactly as before.
 
+CUDA backends need distinct expert ids per token (their mul_mat_id groups tokens by expert): layers placed on CUDA
+are rewritten with one zero expert per routing slot (gguf_hotcold.py --slot-zeros) and a [1, n_expert, k] map; the
+graph then looks ids up per slot. Run the server with --no-op-offload: op offload reads ids before the split runs.
+
 Limits: SILU-gated experts without biases/scales/merged gate_up only (asserted); the cold part runs every layer
 (its zero expert is computed even when no cold expert is selected), which costs one expert read per split layer.
 The large diff in llama-graph.cpp is re-indentation of the original expert block under an else; `git diff -w` is +31.
 
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
 index 29bc406..731ac00 100644
 --- a/src/llama-arch.cpp
@@ -67,10 +72,10 @@ index 651c5f8..20bc00e 100644
      LLM_TENSOR_FFN_GATE_UP_EXPS,
      LLM_TENSOR_FFN_DOWN_SHEXP,
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index e184da5..d412f8a 100644
+index e184da5..4fed668 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -2166,152 +2166,183 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2166,152 +2166,198 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
  
      ggml_tensor * up = nullptr;
      ggml_tensor * experts = nullptr;
@@ -82,9 +87,24 @@ index e184da5..d412f8a 100644
 +                    !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s);
 +        const moe_split_t & sp = *moe_split;
 +        const int64_t n_used = selected_experts->ne[0];
++        // selected_experts is often a view of the per-token argsort: make it contiguous, look all ids up as one list
++        // (get_rows pairs a 3rd dim of the table with the ids' 2nd dim, so a [k, n_tokens] index would not work),
++        // then shape the result back to [k, n_tokens]
++        ggml_tensor * sel = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
++        sel = ggml_reshape_1d(ctx0, sel, n_used * n_tokens);
 +        auto part = [&](ggml_tensor * gate_e, ggml_tensor * up_e, ggml_tensor * down_e, ggml_tensor * map, const char * tag) {
-+            ggml_tensor * ids = ggml_get_rows(ctx0, map, selected_experts);          // [1, n_used, n_tokens]
-+            ids = ggml_reshape_2d(ctx0, ids, n_used, n_tokens);
++            ggml_tensor * ids = nullptr;
++            if (map->ne[2] == 1) {
++                ids = ggml_get_rows(ctx0, map, sel);                                  // [1, n_used * n_tokens] I32
++                ids = ggml_reshape_2d(ctx0, ids, n_used, n_tokens);
++            } else {
++                // one zero expert per slot (parts placed on CUDA): column j of the [1, n_expert, n_used] table sends
++                // an absent expert to zero expert j, so a token never repeats an id (CUDA's mul_mat_id needs that)
++                GGML_ASSERT(map->ne[2] == n_used);
++                ggml_tensor * sel_t = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, sel, n_used, n_tokens)));
++                ids = ggml_get_rows(ctx0, map, sel_t);                                // [1, n_tokens, n_used] I32
++                ids = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, ids, n_tokens, n_used)));
++            }
 +            cb(ids, tag, il);
 +            ggml_tensor * u = build_lora_mm_id(up_e, cur, ids, nullptr);
 +            ggml_tensor * g = build_lora_mm_id(gate_e, cur, ids, nullptr);
@@ -193,9 +213,9 @@ index e184da5..d412f8a 100644
 +            }
          }
 -    }
--
--    const bool has_gate = gate_exps || gate_up_exps;
  
+-    const bool has_gate = gate_exps || gate_up_exps;
+-
 -    switch (type_op) {
 -        case LLM_FFN_SILU:
 -            if (gate_exps) {
@@ -416,7 +436,7 @@ index b09a6cb..6d88ba0 100644
      struct ggml_tensor * ffn_up_exps       = nullptr;
      struct ggml_tensor * ffn_gate_up_exps  = nullptr;
 diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
-index c9b5d7e..dc8e45b 100644
+index c9b5d7e..588d6d2 100644
 --- a/src/models/deepseek4.cpp
 +++ b/src/models/deepseek4.cpp
 @@ -163,9 +163,24 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
@@ -437,8 +457,8 @@ index c9b5d7e..dc8e45b 100644
 +            layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", i), {n_embd, n_ff_exp, nc}, flags);
 +            layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", i), {n_embd, n_ff_exp, nc}, flags);
 +            layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", i), {n_ff_exp, n_embd, nc}, flags);
-+            layer.ffn_exps_map_hot   = create_tensor(tn(LLM_TENSOR_FFN_EXPS_MAP_HOT,   "weight", i), {1, n_expert}, flags);
-+            layer.ffn_exps_map_cold  = create_tensor(tn(LLM_TENSOR_FFN_EXPS_MAP_COLD,  "weight", i), {1, n_expert}, flags);
++            layer.ffn_exps_map_hot   = create_tensor(tn(LLM_TENSOR_FFN_EXPS_MAP_HOT,   "weight", i), {1, n_expert, ml.get_tensor_meta(tn(LLM_TENSOR_FFN_EXPS_MAP_HOT, "weight", i).str().c_str())->ne[2]}, flags);
++            layer.ffn_exps_map_cold  = create_tensor(tn(LLM_TENSOR_FFN_EXPS_MAP_COLD,  "weight", i), {1, n_expert, ml.get_tensor_meta(tn(LLM_TENSOR_FFN_EXPS_MAP_COLD, "weight", i).str().c_str())->ne[2]}, flags);
 +        } else {
 +            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, flags);
 +            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, flags);
@@ -477,7 +497,7 @@ index c9b5d7e..dc8e45b 100644
  
          ggml_tensor * ffn_shexp = build_ffn(cur,
 diff --git a/src/models/glm5next.cpp b/src/models/glm5next.cpp
-index 5b617c0..a971b38 100644
+index 5b617c0..57634d2 100644
 --- a/src/models/glm5next.cpp
 +++ b/src/models/glm5next.cpp
 @@ -199,9 +199,24 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
@@ -498,8 +518,8 @@ index 5b617c0..a971b38 100644
 +                layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", il), {n_embd, hparams.n_ff_exp(), nc}, flags);
 +                layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", il), {n_embd, hparams.n_ff_exp(), nc}, flags);
 +                layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", il), {hparams.n_ff_exp(), n_embd, nc}, flags);
-+                layer.ffn_exps_map_hot   = create_tensor(tn(LLM_TENSOR_FFN_EXPS_MAP_HOT,   "weight", il), {1, n_expert}, flags);
-+                layer.ffn_exps_map_cold  = create_tensor(tn(LLM_TENSOR_FFN_EXPS_MAP_COLD,  "weight", il), {1, n_expert}, flags);
++                layer.ffn_exps_map_hot   = create_tensor(tn(LLM_TENSOR_FFN_EXPS_MAP_HOT,   "weight", il), {1, n_expert, ml.get_tensor_meta(tn(LLM_TENSOR_FFN_EXPS_MAP_HOT, "weight", il).str().c_str())->ne[2]}, flags);
++                layer.ffn_exps_map_cold  = create_tensor(tn(LLM_TENSOR_FFN_EXPS_MAP_COLD,  "weight", il), {1, n_expert, ml.get_tensor_meta(tn(LLM_TENSOR_FFN_EXPS_MAP_COLD, "weight", il).str().c_str())->ne[2]}, flags);
 +            } else {
 +                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), {n_embd, hparams.n_ff_exp(), n_expert}, flags);
 +                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", il), {n_embd, hparams.n_ff_exp(), n_expert}, flags);

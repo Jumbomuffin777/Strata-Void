@@ -70,8 +70,13 @@ def _s(x: str) -> bytes:
     return struct.pack("<Q", len(b)) + b
 
 
-def plan_tensors(h, cold: dict, type_ids: dict) -> list:
-    """[(name, shape, type_id, nbytes, source)] where source is ('copy', file, offset) or ('parts', [...])."""
+def plan_tensors(h, cold: dict, type_ids: dict, slot_zero_layers=(), k: int = 1) -> list:
+    """[(name, shape, type_id, nbytes, source)] where source is ('copy', file, offset) or ('parts', [...]).
+
+    Layers in `slot_zero_layers` give their HOT part one zero expert per routing slot (k of them) and a
+    [1, n_expert, k] map: slot j sends an absent expert to zero expert j, so a token never lists the same hot id
+    twice. CUDA's mul_mat_id groups tokens by expert assuming distinct ids per token and faults otherwise;
+    SYCL and CPU do not need this, so other layers keep one zero expert and a [1, n_expert] map."""
     out = []
     for name, shape, typ, fname, off in h.tensors:
         m = _EXP.match(name)
@@ -86,16 +91,20 @@ def plan_tensors(h, cold: dict, type_ids: dict) -> list:
             raise ValueError(f"layer {layer}: cold list must be distinct ids in 0..{n_expert - 1}")
         hot = [e for e in range(n_expert) if e not in cs]
         slice_b = tensor_bytes(typ, shape[:-1])
+        zeros = {"hot": k if layer in slot_zero_layers else 1, "cold": 1}
         for part, ids in (("hot", hot), ("cold", c)):
-            segs = [("copy", fname, off + e * slice_b, slice_b) for e in ids] + [("zero", slice_b)]
-            out.append((f"blk.{layer}.ffn_{role}_exps_{part}.weight", list(shape[:-1]) + [len(ids) + 1],
-                        type_ids[typ], slice_b * (len(ids) + 1), ("parts", segs)))
+            z = zeros[part]
+            segs = [("copy", fname, off + e * slice_b, slice_b) for e in ids] + [("zero", slice_b * z)]
+            out.append((f"blk.{layer}.ffn_{role}_exps_{part}.weight", list(shape[:-1]) + [len(ids) + z],
+                        type_ids[typ], slice_b * (len(ids) + z), ("parts", segs)))
         if role == "gate":
             for part, ids in (("hot", hot), ("cold", c)):
+                z = zeros[part]
                 idx = {e: i for i, e in enumerate(ids)}
-                table = [idx.get(e, len(ids)) for e in range(n_expert)]
-                out.append((f"blk.{layer}.ffn_exps_map_{part}.weight", [1, n_expert], GGML_I32, 4 * n_expert,
-                            ("bytes", struct.pack(f"<{n_expert}i", *table))))
+                table = [idx.get(e, len(ids) + j) for j in range(z) for e in range(n_expert)]
+                shape_m = [1, n_expert] if z == 1 else [1, n_expert, z]
+                out.append((f"blk.{layer}.ffn_exps_map_{part}.weight", shape_m, GGML_I32, 4 * n_expert * z,
+                            ("bytes", struct.pack(f"<{n_expert * z}i", *table))))
     return out
 
 
@@ -108,12 +117,14 @@ def _nbytes(typ, shape) -> int:
     return tensor_bytes(typ, shape)
 
 
-def write(src_first: Path, cold: dict, out_path: Path, progress=print) -> None:
+def write(src_first: Path, cold: dict, out_path: Path, progress=print, slot_zero_layers=()) -> None:
     from gguf_reader import GGML_TYPES
     h = read_header([src_first])
     type_ids = {v: k for k, v in GGML_TYPES.items()}
     kvs, align = _raw_kvs(h.paths[0])
-    tensors = plan_tensors(h, cold, type_ids)
+    arch = h.metadata.get("general.architecture", "")
+    k = int(h.metadata.get(f"{arch}.expert_used_count", 1))
+    tensors = plan_tensors(h, cold, type_ids, set(int(l) for l in slot_zero_layers), k)
     head = struct.pack("<IIQQ", 0x46554747, 3, len(tensors), len(kvs)) + b"".join(kvs)
     offs, pos = [], 0
     for _name, _shape, _t, nbytes, _src in tensors:
@@ -162,8 +173,14 @@ def main():
     ap.add_argument("gguf")
     ap.add_argument("--cold", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--slot-zeros", default="", help="layers whose hot part runs on CUDA, e.g. 40-45: one zero "
+                    "expert per routing slot (CUDA's mul_mat_id needs distinct ids per token)")
     a = ap.parse_args()
-    write(Path(a.gguf), json.loads(Path(a.cold).read_text()), Path(a.out))
+    layers = set()
+    for part in filter(None, a.slot_zeros.split(",")):
+        lo, _, hi = part.partition("-")
+        layers.update(range(int(lo), int(hi or lo) + 1))
+    write(Path(a.gguf), json.loads(Path(a.cold).read_text()), Path(a.out), slot_zero_layers=layers)
     print("wrote", a.out)
 
 
