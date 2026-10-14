@@ -24,9 +24,9 @@ COMMIT="86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9"        # the commit the patch 
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # applied in this order: the hot/cold expert split, then load-time splitting + adaptive residency + glm5-next names,
-# then the grouped MoE mat-vec for SYCL prefill
+# then the grouped MoE mat-vec for SYCL prefill, then gathered CSA decode attention for DeepSeek V4 (opt-in)
 PATCHES=("$ROOT/patches/llama.cpp-moe-hot-cold-experts.patch" "$ROOT/patches/llama.cpp-moe-dynamic-residency.patch"
-         "$ROOT/patches/llama.cpp-sycl-grouped-moe.patch")
+         "$ROOT/patches/llama.cpp-sycl-grouped-moe.patch" "$ROOT/patches/llama.cpp-dsv4-gather.patch")
 HEADER="$ROOT/patches/llama-moe-residency.h"          # the residency policy, used by the second patch
 DIR="$ROOT/third_party/llama.cpp-hotcold"
 SOURCE="$REPO_URL"

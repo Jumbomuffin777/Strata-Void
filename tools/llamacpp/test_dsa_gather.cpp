@@ -18,6 +18,7 @@
 #include "ggml-sycl.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -69,14 +70,19 @@ static std::vector<float> run(ggml_backend_t backend, int mode, int n_kv, int n_
     return r;
 }
 
-int main() {
+// usage: test_dsa_gather [N_SEL N_KEEP N_KV...]   default: GLM-5.3 DSA (2051 attended, keep 2304, 8K/32K/64K cells).
+// DeepSeek V4 CSA decode: test_dsa_gather 640 768 2176 8320 16512 (128-token window + top-512 of the 4x-compressed
+// cache; n_keep = n_kv_max rounded up to 256; cells = window + context/4).
+int main(int argc, char ** argv) {
     ggml_backend_t gpu = ggml_backend_sycl_init(0);
     if (!gpu) { printf("no SYCL device\n"); return 1; }
     int failures = 0;
-    for (int n_kv : {8192, 32768, 65536}) {
+    const int n_sel = argc > 2 ? atoi(argv[1]) : 2051, n_keep = argc > 2 ? atoi(argv[2]) : ((2048 + 64 + 255) / 256) * 256;
+    std::vector<int> sizes = {8192, 32768, 65536};
+    if (argc > 3) { sizes.clear(); for (int i = 3; i < argc; i++) sizes.push_back(atoi(argv[i])); }
+    for (int n_kv : sizes) {
         std::mt19937 g(n_kv);
         std::normal_distribution<float> nd(0.0f, 1.0f);
-        const int n_sel = 2051, n_keep = ((2048 + 64 + 255) / 256) * 256;
         const float scale = 1.0f / std::sqrt(256.0f);
         std::vector<float> qv((size_t) D * H), kf((size_t) D * n_kv);
         for (auto & x : qv) x = nd(g);

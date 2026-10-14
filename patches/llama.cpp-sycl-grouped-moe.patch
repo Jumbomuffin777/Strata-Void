@@ -10,9 +10,10 @@ llama.cpp-moe-dynamic-residency.patch; same base). Measurements: docs/INTEL_ONLY
 - Hybrid per expert: experts with <= 48 rows (decode-once types; 14 / 8 rows for the generic kernel) use the grouped
   launch, larger ones keep the GEMM path. Decode (one token) is unchanged.
 - GGML_SYCL_MMID_GROUPED=0 (off) / 1 (generic grouped) / 2 (default: + decode-once), GGML_SYCL_MMID_GROUPED_MAX_ROWS=N.
+- An out-of-range expert id now names its ids tensor, token, slot and row before aborting (open issue:
+  intermittent, see INTEL_ONLY_CONTINUATION.md).
 - test-backend-ops: perf cases at the GLM-5.3-Flash / DeepSeek V4 Flash expert shapes (4096 x 2048, 288 x top-8,
   256 x top-6).
-
 diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
 index dc6cdd3..a7be507 100644
 --- a/ggml/src/ggml-sycl/common.hpp
@@ -26,7 +27,7 @@ index dc6cdd3..a7be507 100644
      static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
  
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 686a4c7..5dd82c4 100644
+index 686a4c7..ec092ec 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -104,6 +104,8 @@ int g_ggml_sycl_enable_vmm = 1;
@@ -55,7 +56,27 @@ index 686a4c7..5dd82c4 100644
  
          g_ggml_sycl_use_async_mem_op_requested = ggml_sycl_get_env("GGML_SYCL_USE_ASYNC_MEM_OP", 1);
          GGML_LOG_INFO("  GGML_SYCL_USE_ASYNC_MEM_OP: %d\n", g_ggml_sycl_use_async_mem_op_requested);
-@@ -5219,10 +5224,63 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -5074,7 +5079,18 @@ static void mmid_counting_sort_rows(
+     for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
+         for (int64_t id = 0; id < n_ids; id++) {
+             const int32_t row_id_i = *(const int32_t *) (ids_host + iid1*ids->nb[1] + id*ids->nb[0]);
+-            GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
++            if (row_id_i < 0 || row_id_i >= n_as) {
++                // say which ids tensor (layer, hot/cold part), token and slot, and the token's whole row, before aborting
++                std::string row;
++                for (int64_t j = 0; j < n_ids; j++) {
++                    row += std::to_string(*(const int32_t *) (ids_host + iid1*ids->nb[1] + j*ids->nb[0])) + " ";
++                }
++                GGML_LOG_ERROR("%s: expert id %d out of range [0, %lld) in %s (src %s), token %lld of %lld, slot %lld; "
++                               "row: %s\n", __func__, row_id_i, (long long) n_as, ids->name,
++                               ids->src[0] ? ids->src[0]->name : "-", (long long) iid1, (long long) ids->ne[1],
++                               (long long) id, row.c_str());
++                GGML_ABORT("MUL_MAT_ID expert id out of range");
++            }
+             expert_counts[row_id_i]++;
+         }
+     }
+@@ -5219,10 +5235,63 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
              });
          }
  

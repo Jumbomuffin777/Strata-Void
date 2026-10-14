@@ -160,6 +160,25 @@ Greedy tokens first differ at token 59 / 43 / 23 (short / 8K / 32K), chosen-toke
 0.62. That is the size of an ordinary precision change (q8 vs f16 KV: token 10, 0.77) and larger than run-to-run noise
 (token 83, 0.05): prefill activations are now quantized to Q8_1 for the expert products, as the decode path (and
 llama.cpp's CUDA MMQ prefill) already does.
+Perplexity (llama-perplexity, same split and settings, ctx 2048, ubatch 1024, 6 chunks of a fixed 60 KB text: two
+licence texts and two of this repository's docs): `=0` **1.8938 +/- 0.042**, `=2` **1.8927 +/- 0.042**, every chunk
+within 0.012; 29.9 -> 21.9 s per 2048-token pass. The greedy divergence above is precision noise, not a quality loss.
+
+### DeepSeek V4 Flash: grouped prefill and gathered CSA decode (same session, same method, 128 decoded tokens)
+
+`GROUPED:GATHER` = `GGML_SYCL_MMID_GROUPED` : `LLAMA_DSV4_GATHER` (`patches/llama.cpp-dsv4-gather.patch`).
+
+| prompt | 0:0 prefill / decode | 2:0 prefill / decode | 2:1 prefill / decode |
+|---|---|---|---|
+| 8K | 62.8 / 9.04 tok/s | **79.9** / 9.07 | 80.2 / 7.03 (gather below its threshold now) |
+| 32K | 47.0 / 7.48 | **55.5** / 7.42 | 55.6 / **8.83** |
+| 64K | 32.1 / 6.32 | (run aborted, see open issues) | **36.0** / **7.71** |
+
+Needle found in every completed run; host RSS 17.7 GiB. **Correctness:** 0:0 against 2:1 (both changes), 128 greedy
+tokens: identical at short, 8K, 32K and 64K; chosen-token log-probability within 0.08 / 0.16 / 0.47 / 0.22.
+`test_dsa_gather 640 768 2176 8320 16512` (DeepSeek's window 128 + top-512 over the 4x cache): kept set exact, error
+against an f64 reference 1.3-1.5e-3 (dense path 2.3-2.4e-3). At 8K the gather was slower (9.04 -> 7.03 tok/s: the
+top-k pass over ~2,200 cells costs more than it saves); it now applies only from 4,096 cells (about 16K of context).
 
 ## Changes and their measured effect
 

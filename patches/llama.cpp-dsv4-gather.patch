@@ -1,0 +1,49 @@
+Gathered CSA attention for DeepSeek V4 decode on backends whose flash attention ignores n_kv_max (SYCL). On top of
+the three patches before it; same base. Opt-in: LLAMA_DSV4_GATHER=1; only from 4096 cells (about 16K of context), LLAMA_DSV4_GATHER_MIN_CELLS overrides.
+
+DeepSeek V4's CSA layers (compression ratio 4) attend over the raw window plus the whole 4x-compressed cache under a
+mask that keeps the indexer's top-k, and pass n_kv_max = window + top_k to flash attention. By ggml's contract n_kv_max
+bounds the finite entries of every mask row, so for one decoded token the n_keep = pad(n_kv_max, 256) largest mask
+entries are exactly the attended cells plus -inf padding. The gathered path takes those, gathers their keys (K = V) and
+mask values, and runs flash attention over n_keep cells instead of window + context/4. HCA and window-only layers are
+unchanged. CUDA, Vulkan and Metal use n_kv_max inside their kernels and do not need this.
+
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 588d6d2..f3f6684 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -773,6 +773,34 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+     cb(kq_mask, "csa_lid_kq_mask", il);
+ 
+     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
++
++    // LLAMA_DSV4_GATHER=1 (Strata Void), one token, one stream (decode): attend over the finite mask entries only.
++    // By the flash-attention contract n_kv_max bounds the finite entries of every mask row (the raw window plus the
++    // indexer's top-k compressed cells), so the n_keep >= n_kv_max largest entries are all of them plus -inf padding:
++    // same cells, same softmax (sinks unchanged), but flash attention reads ~n_keep cells instead of the whole
++    // compressed cache. Backends whose kernels use n_kv_max themselves (CUDA, Vulkan, Metal) do not need this.
++    // Below ~4K cells (about 16K of context) the top-k pass costs more than it saves (measured: 8K slower, 32K faster);
++    // LLAMA_DSV4_GATHER_MIN_CELLS overrides.
++    static const bool dsv4_gather = [] { const char * e = getenv("LLAMA_DSV4_GATHER"); return e && atoi(e) == 1; }();
++    static const int64_t dsv4_gather_min = [] { const char * e = getenv("LLAMA_DSV4_GATHER_MIN_CELLS"); return e ? atoll(e) : 4096LL; }();
++    const int64_t n_kv_all = k_all->ne[2];
++    const int64_t n_keep   = GGML_PAD(n_kv_max, 256);
++    if (dsv4_gather && n_tokens == 1 && n_kv_all >= dsv4_gather_min && k_all->ne[1] == 1 && k_all->ne[3] == 1 &&
++            kq_mask->ne[0] == n_kv_all && kq_mask->ne[1] == 1 && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1 &&
++            n_keep < n_kv_all) {
++        ggml_tensor * m32  = ggml_cast(ctx0, ggml_reshape_1d(ctx0, ggml_cont(ctx0, kq_mask), n_kv_all), GGML_TYPE_F32);
++        ggml_tensor * keep = ggml_top_k(ctx0, ggml_reshape_2d(ctx0, m32, n_kv_all, 1), (int) n_keep);   // I32 [n_keep, 1]
++        keep = ggml_reshape_1d(ctx0, ggml_cont(ctx0, keep), n_keep);
++        cb(keep, "dsv4_keep_cells", il);
++        ggml_tensor * k2 = ggml_view_2d(ctx0, k_all, k_all->ne[0], n_kv_all, k_all->nb[2], 0);         // rows = cells
++        ggml_tensor * kg = ggml_cast(ctx0, ggml_get_rows(ctx0, k2, keep), GGML_TYPE_F16);              // [D, n_keep]
++        kg = ggml_reshape_4d(ctx0, kg, k_all->ne[0], 1, n_keep, 1);
++        ggml_tensor * mg = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, m32, 1, n_kv_all), keep);          // [1, n_keep]
++        mg = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mg, n_keep, 1, 1, 1), kq_mask->type);
++        cb(mg, "dsv4_keep_mask", il);
++        k_all = kg; kq_mask = mg;
++    }
++
+     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
+     if (k_rot) {
+         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
