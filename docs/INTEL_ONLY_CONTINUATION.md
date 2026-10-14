@@ -56,6 +56,12 @@ A handover for whoever continues the Intel-only GLM-5.3-Flash / DeepSeek V4 Flas
 - Intermittent `GGML_ASSERT` "expert id out of range" in ggml-sycl's mul_mat_id (an invalid expert id reaching a GPU):
   once in a Maya-S warmup (f16 KV + gathered attention), and once in a DeepSeek 64K prefill with the grouped MoE path
   (2026-10-14). The second run of the same prompt with the same prefill path did not fail, so it is not deterministic
-  for that input. The assertion now prints the ids tensor, token, slot and row; capture that the next time it happens.
+  for that input; a later stress run (6 distinct uncached ~17K-token prompts, 104K tokens) did not fail either. Both
+  aborts are the same check in the same place (`mmid_counting_sort_rows`, a multi-token MUL_MAT_ID), and the Maya-S one
+  predates the grouped MoE kernel, so the kernel is not the cause. Ruled out by reading the code: the expert argsort
+  (padding sorts last whatever the scores, NaN included, so top-k indices are always valid), the hot/cold map lookup
+  (valid values only), and the scheduler's cross-backend copies (synchronous for SYCL). Left: a stale or overwritten
+  ids buffer. The assertion now prints the ids tensor, its source, token, slot and the whole row; capture that the
+  next time it happens (garbage-looking values point at a buffer race, a single bad id at the routing).
   Stress-test loads of the recommended configuration before relying on it unattended.
 - Prompt reading is slow (~50-60 tok/s): a 64K prompt takes 12-20 minutes before the first token.
