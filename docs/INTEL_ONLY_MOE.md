@@ -60,6 +60,41 @@ short prompts at a 64K/128K context; it is not a like-for-like baseline. With st
 faster than that at short and 8K prompts and slower at 32K and 64K; with gathered sparse attention (below) it decodes
 above 11 tok/s at every size measured.
 
+### Static versus adaptive expert residency (Maya-S, gathered attention on, same workload)
+
+`LLAMA_MOE_DYNAMIC=observe` (static placement, hit rate logged) against `=1` (adaptive: up to 24 swaps every 32
+tokens), same prompts, same settings:
+
+| | static (observe) | adaptive |
+|---|---|---|
+| hot hit rate, decoding after the 8K / 32K prompt | 89-90 % | 92.6 -> 95.9 % (8K), 89.6 -> 95.5 % (32K) |
+| swaps | 0 | 1,920 over the run, 3.6 ms each (6.9 s in all) |
+| decode short / 8K / 32K (run 1 / run 2), tok/s | 12.14 / 12.14, 10.08 / 11.43, 11.20 / 11.18 | 11.98 / 12.18, 10.01 / 11.53, 10.94 / 11.21 |
+
+* The offline plan predicted 97.7 % hot from its calibration text; on these prompts static placement hits 89-90 %.
+  Adaptive residency recovers most of the difference within a few hundred tokens of a new prompt.
+* It does not make decode faster here: a miss costs little (the expert is computed by the CPU, which runs the cold part
+  of every split layer anyway; that segment is mostly fixed round-trip cost), while observing the routing costs ~3 %
+  (12.54 -> 12.14 tok/s short) and swaps cost while they happen. It stays off by default; it would matter where a
+  miss is expensive (a slower CPU path, an NVMe tier, or a runtime that skips the cold part when no cold expert is
+  selected).
+
+## DeepSeek V4 Flash UD-IQ3_XXS, Intel only, static placement
+
+Same method; load-time split of the original file (16.4 GiB cold), layers 16 / 16 / 11, ubatch 1024, 64K q8 KV; the
+test process held 17.4 GB of host memory.
+
+| prompt | prefill | TTFT | decode (run 1 / run 2) | needle |
+|---|---|---|---|---|
+| short | - | 1.3 s | 10.28 / 10.25 tok/s | - |
+| 8K | 62.4 tok/s | 127 s | 9.10 / 9.46 tok/s | found |
+| 32K | 46.9 tok/s | 546 s | 7.52 / 7.76 tok/s | found |
+| 64K | 32.1 tok/s | 1053 s | 6.34 / 6.41 tok/s | found |
+
+The earlier ~7.0 tok/s was UD-IQ3_S on Arc + CUDA RPC GPUs. DeepSeek's sparse attention (compressed cache plus a
+window) is a different graph from GLM's DSA; the gathered-attention change does not apply to it yet, and its decode
+also slows with depth.
+
 ### Where a decoded token goes (profile, ms per token)
 
 | segment | depth 512 | depth 32K |
@@ -92,6 +127,7 @@ launch per expert, a few rows each). A larger ubatch amortizes it: 256 -> 1024 r
 | load-time hot/cold split (`LLAMA_MOE_HOTCOLD`) | no rewritten copy of the model; tensors identical to a rewrite | yes |
 | CPU skips experts its cold part does not hold (id -1) | decode 10.1 -> 12.6 tok/s (short), prefill 30 -> 34 tok/s (ubatch 256); greedy text identical | yes |
 | ubatch 1024 | prefill 34 -> 60 tok/s (8K) | yes (config) |
+| adaptive residency (`LLAMA_MOE_DYNAMIC=1`) | hit rate 89-90 % -> ~95.5 %; decode unchanged within noise | off by default |
 | grouped expert GEMM for SYCL prefill (oneMKL group batch) | prefill **slower** on the real model (58.6 vs 77.3 tok/s profiled) | no, removed |
 | f16 instead of q8_0 KV | decode at 32K 111.1 -> 109.2 ms | no |
 | gathered sparse attention (`LLAMA_DSA_GATHER=1`) | decode at 32K 111.3 -> 87.1 ms/token (profile); 64K 6.5 -> 11.1 tok/s (benchmark) | yes, opt-in |
