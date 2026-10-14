@@ -180,6 +180,25 @@ tokens: identical at short, 8K, 32K and 64K; chosen-token log-probability within
 against an f64 reference 1.3-1.5e-3 (dense path 2.3-2.4e-3). At 8K the gather was slower (9.04 -> 7.03 tok/s: the
 top-k pass over ~2,200 cells costs more than it saves); it now applies only from 4,096 cells (about 16K of context).
 
+### GPU minimum clock (Maya-S, Intel only, one load, interleaved trials)
+
+Question: in a layer split each GPU idles about two thirds of every token; does a higher `min_freq` floor remove a
+clock ramp? Method: one Maya-S load (production profile: grouped prefill, no gathered attention, 64K q8 KV); B65 / B60
+floors held at 2400 MHz; the B70 floor switched live between 400 and 2400 MHz in ABBA order, 8 trials per context,
+128 decoded tokens each on a cached prompt; telemetry every 50 ms (actual GPU clock, package temperature, energy
+counter, throttle reasons).
+
+| context | B70 floor 400 MHz | B70 floor 2400 MHz |
+|---|---|---|
+| 32K (36,173-token prompt; prefill 78.3 tok/s) | 109.53 ms/token (spread 0.72) | 109.37 ms/token (spread 0.21) |
+| short | 74.92 ms/token (spread 0.89) | 74.86 ms/token (spread 0.42) |
+| B70 actual clock while active | 2768-2800 MHz, <= 1.4 % of samples below 2 GHz | 2790-2800 MHz |
+
+No measurable effect: the driver keeps the B70 near its 2800 MHz ceiling through the short idle gaps of a layer split
+whatever the floor, so there is no ramp latency to remove. Raising the floor costs nothing at idle either (cards
+power-gate; 19-22 W measured both ways). Under load: 40-76 W per card, package <= 54 C, brief `pl2` / `pl4`
+(short-term power / current limit) flags only.
+
 ## Changes and their measured effect
 
 | change | effect | kept |
