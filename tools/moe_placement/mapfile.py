@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 
 from . import FORMAT, FORMAT_VERSION
+from . import descriptor
 from .descriptor import FINGERPRINT_METHOD, ModelDescriptor
 from .lookup import check_consistent
 from .planner import Placement
@@ -115,7 +116,7 @@ def validate(m: dict, d: ModelDescriptor | None = None, *, stats_only: bool = Fa
         raise MapError("tensors: the layers listed differ from model.moe_layers")
 
     if d is not None:
-        if m["checkpoint"]["architecture"] != d.architecture:
+        if descriptor.canonical_arch(m["checkpoint"]["architecture"]) != descriptor.canonical_arch(d.architecture):
             raise MapError(f"map is for architecture {m['checkpoint']['architecture']!r}, checkpoint is "
                            f"{d.architecture!r}")
         for k, v in (("n_layers", d.n_layers), ("n_expert", d.n_expert), ("n_expert_used", d.n_expert_used),

@@ -22,6 +22,13 @@ Strata Void's version numbers are its own, independent of upstream's engine vers
 - `serve/test_llamacpp.py` (36 tests, in CI) against `serve/llamacpp_fake_server.py`, a stand-in llama-server process; no GPU, model or llama.cpp build. Also checked by hand against the real patched `llama-server` (CPU build, a small dense model): passthrough, streaming, Task-Parallel synthesis and sections, cancellation, restart after a killed server, a stop that ends running requests at once.
 - Hot/cold experts for llama.cpp: `tools/llamacpp/routing-dump.cpp` (measured routing: the top 85% of experts carry 96.2% of GLM-5.3-Flash's and 97.6% of DeepSeek V4 Flash's activations), `llamacpp_hotcold.py` (per-GPU placement by dynamic programming), `gguf_hotcold.py` (byte-exact GGUF rewrite) and `patches/llama.cpp-moe-hot-cold-experts.patch`. Measured with split layers on SYCL GPUs + CPU and CUDA RPC layers kept whole (`--no-split`): GLM 6.9 -> 9.4-9.9 tok/s, DeepSeek 6.1 -> 7.0 tok/s, coherent output, 11-19K-token prompts read.
 
+**Intel-only GLM-5.3-Flash (Maya-S) and DeepSeek V4 Flash: the llama.cpp backend, second patch**
+
+- `patches/llama.cpp-moe-dynamic-residency.patch` (applied by `build_hotcold.sh` after the hot/cold patch, with `patches/llama-moe-residency.h`): hot/cold split of the original GGUF at load time (`LLAMA_MOE_HOTCOLD`, no rewritten copy); the CPU skips experts its cold part does not hold (expert id -1 in ggml-cpu's mul_mat_id; Maya-S decode 10.1 -> 12.6 tok/s, greedy text identical); adaptive expert residency (`LLAMA_MOE_DYNAMIC`); decode attention over the DSA indexer's selected cells only (`LLAMA_DSA_GATHER`, GLM-5.3: 32K decode 111 -> 87 ms/token); Project Maya's `glm5-next` architecture name.
+- Measured on three Intel Arc Pro GPUs + host RAM only: [docs/INTEL_ONLY_MOE.md](docs/INTEL_ONLY_MOE.md) (method, decode at 8K/32K/64K, per-segment profile, what was kept and what was rejected - a grouped SYCL expert GEMM made prefill slower and was removed).
+- Tools: `tools/llamacpp/op-profile.cpp` (per-op and per-segment timing, prefill and decode), `bench_hotcold.py` (repeatable TTFT / prefill / decode at fixed prompt sizes), `compare_logprobs.py` (greedy log-probability comparison of two runs); tests `test_moe_residency.cpp` (policy, in CI), `test_mmid_skip.cpp` (CPU id -1, 6 types), `test_dsa_gather.cpp` (gathered vs dense attention against an f64 reference, exact kept set). `build_hotcold.sh` no longer stops silently when oneAPI's `setvars.sh` is sourced under `set -u`.
+- `tools/moe_placement` reads `glm5-next` files (Project Maya) as `glm5next`.
+
 ## void-v0.1.1 (2026-10-11)
 
 **Server protocol fixes, not a new SYCL kernel optimization**

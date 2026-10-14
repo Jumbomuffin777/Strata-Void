@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # build_hotcold.sh - build the llama.cpp that serves hot/cold GGUFs (tools/moe_placement/gguf_hotcold.py):
-# clone llama.cpp at the pinned commit, apply patches/llama.cpp-moe-hot-cold-experts.patch, build llama-server
-# (+ ggml-rpc-server with RPC) and tools/llamacpp/routing-dump.cpp against it. See docs/MOE_PLACEMENT.md.
+# clone llama.cpp at the pinned commit, apply patches/llama.cpp-moe-hot-cold-experts.patch and
+# patches/llama.cpp-moe-dynamic-residency.patch, build llama-server (+ ggml-rpc-server with RPC) and the tools
+# routing-dump and op-profile against it. See docs/HOTCOLD_LLAMACPP.md.
 #
 #   tools/llamacpp/build_hotcold.sh                      SYCL + RPC (Intel GPUs; needs oneAPI)
 #   tools/llamacpp/build_hotcold.sh --cuda               SYCL + CUDA + RPC
@@ -14,7 +15,7 @@
 #   --cpu              no SYCL (CPU + RPC);   --no-rpc  leave the RPC backend out
 #   --jobs N           parallel build jobs (default: all cores)
 #   --check            clone and check that the patch applies, build nothing
-#   --no-routing-dump  do not build tools/llamacpp/routing-dump
+#   --no-routing-dump  do not build tools/llamacpp/routing-dump and op-profile
 # Extra CMake options: CMAKE_EXTRA="-DGGML_SYCL_DNN=OFF" tools/llamacpp/build_hotcold.sh
 set -euo pipefail
 
@@ -22,7 +23,9 @@ REPO_URL="https://github.com/unslothai/llama.cpp.git"   # branch glm5next/upstre
 COMMIT="86ebfef2c6a0f3359a2a07d2c215d61b0fa885c9"        # the commit the patch is made for
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PATCH="$ROOT/patches/llama.cpp-moe-hot-cold-experts.patch"
+# applied in this order: the hot/cold expert split, then load-time splitting + adaptive residency + glm5-next names
+PATCHES=("$ROOT/patches/llama.cpp-moe-hot-cold-experts.patch" "$ROOT/patches/llama.cpp-moe-dynamic-residency.patch")
+HEADER="$ROOT/patches/llama-moe-residency.h"          # the residency policy, used by the second patch
 DIR="$ROOT/third_party/llama.cpp-hotcold"
 SOURCE="$REPO_URL"
 SYCL=1 CUDA=0 RPC=1 CHECK=0 DUMP=1 CUDA_ARCH="native"
@@ -48,7 +51,7 @@ while [ $# -gt 0 ]; do
 done
 
 command -v git >/dev/null || die "git is not installed"
-[ -f "$PATCH" ] || die "the patch is missing: $PATCH"
+for P in "${PATCHES[@]}" "$HEADER"; do [ -f "$P" ] || die "missing: $P"; done
 
 # --- 1. the pinned source --------------------------------------------------------------------------------------------
 if [ ! -d "$DIR/.git" ]; then
@@ -63,19 +66,33 @@ fi
 HEAD="$(git -C "$DIR" rev-parse HEAD)"
 [ "$HEAD" = "$COMMIT" ] || die "$DIR is at $HEAD, not the pinned $COMMIT: use another --dir, or remove it"
 
-# --- 2. the patch ----------------------------------------------------------------------------------------------------
-if git -C "$DIR" apply --whitespace=nowarn --reverse --check "$PATCH" 2>/dev/null; then
-  say "patch already applied"
-elif ERR="$(git -C "$DIR" apply --whitespace=nowarn --check "$PATCH" 2>&1)"; then
-  [ "$CHECK" = 1 ] && { say "the patch applies cleanly to $COMMIT (--check: nothing changed)"; exit 0; }
-  git -C "$DIR" apply --whitespace=nowarn "$PATCH"
-  say "patch applied"
-else
-  echo "$ERR" >&2
-  die "the hot/cold patch does not apply to $DIR. It is made for $COMMIT exactly; if the checkout has local edits,
-  start from a clean one (git -C '$DIR' checkout -- . ), or rebase the patch (docs/MOE_PLACEMENT.md)"
+# --- 2. the patches -------------------------------------------------------------------------------------------------
+# apply_series DIR: applies every patch not yet applied, in order; stops with the reason if one does not apply
+apply_series() {
+  local d="$1" p err
+  for p in "${PATCHES[@]}"; do
+    if git -C "$d" apply --whitespace=nowarn --reverse --check "$p" 2>/dev/null; then
+      say "already applied: $(basename "$p")"
+    elif err="$(git -C "$d" apply --whitespace=nowarn --check "$p" 2>&1)"; then
+      git -C "$d" apply --whitespace=nowarn "$p"
+      say "applied: $(basename "$p")"
+    else
+      echo "$err" >&2
+      die "$(basename "$p") does not apply to $d. The patches are made for $COMMIT exactly; if the checkout has local
+  edits, start from a clean one (git -C '$d' checkout -- . ), or rebase the patches (docs/MOE_PLACEMENT.md)"
+    fi
+  done
+  cp "$HEADER" "$d/src/"
+}
+if [ "$CHECK" = 1 ]; then                       # on a throwaway copy: the checkout itself is left as it is
+  TMP="$(mktemp -d)"
+  trap 'rm -rf "$TMP"' EXIT
+  git clone -q --shared "$DIR" "$TMP/l" && git -C "$TMP/l" -c advice.detachedHead=false checkout -q "$COMMIT"
+  apply_series "$TMP/l"
+  say "--check: the patches apply cleanly to $COMMIT; nothing changed, nothing built"
+  exit 0
 fi
-[ "$CHECK" = 1 ] && { say "--check: the patch is in place, nothing built"; exit 0; }
+apply_series "$DIR"
 
 # --- 3. build --------------------------------------------------------------------------------------------------------
 command -v cmake >/dev/null || die "cmake is not installed"
@@ -116,14 +133,16 @@ cmake --build "$BUILD" --target "${TARGETS[@]}" -j "$JOBS"
 if [ "$DUMP" = 1 ]; then
   CXX="$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt")"
   CXX="${CXX:-c++}"
-  say "building routing-dump with $CXX"
+  say "building routing-dump and op-profile with $CXX"
   cmake --build "$BUILD" --target llama-common -j "$JOBS" >/dev/null 2>&1 || cmake --build "$BUILD" --target common -j "$JOBS"
   COMMON_LIB=llama-common
   ls "$BUILD"/bin/libllama-common.* >/dev/null 2>&1 || COMMON_LIB=common
-  "$CXX" -O2 -std=c++17 -I"$DIR/include" -I"$DIR/common" -I"$DIR/ggml/include" -I"$DIR/vendor" \
-    "$ROOT/tools/llamacpp/routing-dump.cpp" -o "$BUILD/bin/routing-dump" \
-    -L"$BUILD/bin" -l"$COMMON_LIB" -lllama -lggml -lggml-base -Wl,-rpath,"$BUILD/bin" \
-    || echo "build_hotcold: routing-dump did not build (llama-server did); see tools/llamacpp/routing-dump.cpp" >&2
+  for tool in routing-dump op-profile; do
+    "$CXX" -O2 -std=c++17 -I"$DIR/include" -I"$DIR/common" -I"$DIR/ggml/include" -I"$DIR/vendor" \
+      "$ROOT/tools/llamacpp/$tool.cpp" -o "$BUILD/bin/$tool" \
+      -L"$BUILD/bin" -l"$COMMON_LIB" -lllama -lggml -lggml-base -Wl,-rpath,"$BUILD/bin" \
+      || echo "build_hotcold: $tool did not build (llama-server did); see tools/llamacpp/$tool.cpp" >&2
+  done
 fi
 
 say "done: $BUILD/bin/llama-server"

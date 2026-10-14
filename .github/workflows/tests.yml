@@ -41,6 +41,10 @@ jobs:
         run: |
           bash -n tools/llamacpp/build_hotcold.sh
           python -m unittest serve.test_llamacpp -v
+      - name: MoE residency policy (C++, no llama.cpp build)
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -I patches tools/llamacpp/test_moe_residency.cpp -o /tmp/test_moe_residency
+          /tmp/test_moe_residency
       - name: Example configs parse
         run: |
           python - <<'PY'

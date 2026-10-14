@@ -187,6 +187,20 @@ class TestAdapters(Base):
         b = descriptor.describe([self.dir / "b.gguf"])[0]
         self.assertNotEqual(a.fingerprint, b.fingerprint)
 
+    def test_glm5_next_spelling(self):
+        """Project Maya's files say "glm5-next" with keys under that prefix: the same adapter and numbers."""
+        meta, t = glm_like()
+        alt = {(k.replace("glm5next.", "glm5-next.", 1) if k.startswith("glm5next.") else k): v for k, v in meta.items()}
+        alt["general.architecture"] = "glm5-next"
+        a, b = self.dir / "a.gguf", self.dir / "b.gguf"
+        write_gguf(a, meta, t)
+        write_gguf(b, alt, t)
+        da, db = descriptor.describe([a])[0], descriptor.describe([b])[0]
+        self.assertEqual(db.architecture, "glm5-next")
+        self.assertEqual((da.moe_layers, da.mtp_layers, da.kv_bytes_per_token, da.state_bytes),
+                         (db.moe_layers, db.mtp_layers, db.kv_bytes_per_token, db.state_bytes))
+        self.assertEqual(descriptor.canonical_arch("glm5-next"), "glm5next")
+
     def test_unknown_architecture(self):
         meta, t = glm_like()
         meta = {k.replace("glm5next", "mystery"): v for k, v in meta.items()}

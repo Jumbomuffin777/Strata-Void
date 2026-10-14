@@ -88,6 +88,14 @@ Every split layer's `ffn_{gate,up,down}_exps` become `_hot` and `_cold` tensors 
 is copied byte for byte (tested; on the real models 90 random expert slices each were checked against the source).
 A sharded input is read across its shards; the output is one file.
 
+### Without a rewritten copy
+
+The second patch lets llama.cpp build the same hot/cold tensors at load time from the ORIGINAL GGUF: set
+`LLAMA_MOE_HOTCOLD=cold.json` (the planner's output) in llama-server's environment (`"env"` in the server config) and
+keep the `-ot` rule. A new placement is then a new `cold.json` and a restart, not another copy of the model; mmap is
+switched off for that load (the split tensors are assembled in memory). Step 4 stays useful for a backend that must
+mmap, and for CUDA layers that need `--slot-zeros`.
+
 ## 5. Serve
 
 Copy [examples/llamacpp-hotcold/server.json](../examples/llamacpp-hotcold/server.json), put in the model path and
@@ -127,6 +135,17 @@ native engine. Requests with tools, images or a structured `response_format` tak
 A client that disconnects cancels its request in llama-server (a streamed one at once; a whole answer when
 llama-server next checks its connection, within a few seconds). When llama-server dies, a running stream ends with an
 error event and the next request starts it again. The process stops with Strata Void (Ctrl+C or SIGTERM).
+
+## Runtime switches (second patch)
+
+| environment | what it does |
+|---|---|
+| `LLAMA_MOE_HOTCOLD=cold.json` | split the original GGUF's experts at load time (above) |
+| `LLAMA_MOE_COLD_SKIP=0` | keep the cold part's all-zero expert; by default the CPU skips experts it does not hold (decode +25 %, identical output) |
+| `LLAMA_MOE_DYNAMIC=1` / `observe` | adaptive residency: swap cold experts the conversation uses into hot slots (fixed slot counts) / only log the hot hit rate |
+| `LLAMA_DSA_GATHER=1` | GLM-5.3: decode attends over the indexer's selected cells only instead of the whole cache under a mask |
+
+Measurements and the evidence behind each: [INTEL_ONLY_MOE.md](INTEL_ONLY_MOE.md).
 
 ## Rules the patched runtime needs
 

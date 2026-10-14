@@ -340,6 +340,14 @@ class DeepSeek4Adapter(Adapter):
 
 
 ADAPTERS = {a.arch: a for a in (Qwen4ExpAdapter, Glm5NextAdapter, DeepSeek4Adapter)}
+# other spellings of the same architecture: Project Maya's GLM-5.3-Flash files say "glm5-next" (the standard GGUF name),
+# the first llama.cpp port and unsloth's files "glm5next"; metadata keys follow each file's own spelling
+ALIASES = {"glm5-next": "glm5next"}
+ADAPTERS.update({alias: ADAPTERS[name] for alias, name in ALIASES.items()})
+
+
+def canonical_arch(arch: str) -> str:
+    return ALIASES.get(arch, arch)
 
 
 def describe(paths, allow_generic: bool = False) -> tuple[ModelDescriptor, Header]:

@@ -7,6 +7,7 @@ flow that makes the GGUF and the placement arguments is in [docs/HOTCOLD_LLAMACP
 | config | layout | notes |
 |---|---|---|
 | `server.json` | three local SYCL GPUs, cold experts in host RAM | 64K context in 2 slots of 32K (Task-Parallel Requests use them), loaded at start |
+| `server-intel-only.json` | three local SYCL GPUs, cold experts in host RAM, the ORIGINAL GGUF split at load time (`LLAMA_MOE_HOTCOLD`, no rewritten copy) | Maya-S at 64K; sparse-attention decode on (`LLAMA_DSA_GATHER`); measured in [docs/INTEL_ONLY_MOE.md](../../docs/INTEL_ONLY_MOE.md) |
 | `server-rpc.json` | three local SYCL GPUs + one llama.cpp RPC device, cold experts in host RAM | 1 slot, loaded on the first request, unloaded after 30 idle minutes |
 
 Before you use them:
