@@ -120,6 +120,47 @@ also slows with depth.
 launch per expert, a few rows each). A larger ubatch amortizes it: 256 -> 1024 raised prefill from 33.5 to 59.7 tok/s
 (8K); 2048 runs out of GPU memory in flash attention's scratch at long prompts.
 
+### Prefill: grouped MUL_MAT_ID (`patches/llama.cpp-sycl-grouped-moe.patch`)
+
+Measured in isolation first: `test-backend-ops perf -o MUL_MAT_ID` on the B70 at the models' expert shapes (4096 x
+2048 experts, uniform random routing; GLM 288 x top-8, DeepSeek 256 x top-6). The per-expert path costs ~190 us per
+expert plus ~2 us per routed row however few rows the expert gets: it dequantizes the whole expert to f16 (16 MiB)
+before its GEMM. The grouped path quantizes the sorted rows to Q8_1 once and runs one launch over tiles of <= 8 rows of
+one expert; for IQ2_XXS / IQ2_S / IQ3_XXS a lane decodes its 32 codebook weights once and reuses them for every row of
+the tile with dp4a (~5.4 us per routed row). Experts with more than 48 rows keep the GEMM path.
+
+| op, tokens | per-expert (before) | generic grouped | decode-once grouped (default) |
+|---|---|---|---|
+| GLM gate/up IQ2_XXS, 256 | 57.3 ms | 29.0 ms | 10.5 ms |
+| GLM gate/up IQ2_XXS, 1024 | 71.1 ms | 111.0 ms | 44.0 ms |
+| GLM down IQ3_XXS, 256 | 55.4 ms | 45.6 ms | 15.1 ms |
+| GLM down IQ3_XXS, 1024 | 74.1 ms | 171.7 ms | 43.2 ms |
+| DeepSeek gate/up IQ2_S, 1024 | 55.9 ms | 84.7 ms | 35.4 ms |
+| DeepSeek down IQ3_XXS, 1024 | 66.5 ms | 129.2 ms | 33.2 ms |
+| decode, 1 token (unchanged path) | 130-133 us | - | 130 us |
+
+The generic grouped kernel (the existing vec_dot per row) loses at 1024 tokens because it decodes the codebook again
+for every row; IQ2_XXS's vec_dot is scalar. `test-backend-ops test -o MUL_MAT_ID`: 913/913 against the CPU on the B70
+and the B60, at the default and with the threshold forced to 1, 4 and 1000 rows (every expert grouped / mixed / none).
+Switch: `GGML_SYCL_MMID_GROUPED=0` (before), `1` (generic), `2` (default); `GGML_SYCL_MMID_GROUPED_MAX_ROWS=N`.
+
+On the real model (Maya-S, Intel only, gathered attention on, ubatch 1024, 64K q8 KV; same server settings, one
+load each; `prefill-ab` = bench_hotcold.py `--decode 64` then compare_logprobs.py on the cached prompts):
+
+| | `GGML_SYCL_MMID_GROUPED=0` | `=2` (default) |
+|---|---|---|
+| 8K prompt (7,885 new tokens) | 60.6 tok/s, TTFT 133 s | **86.8 tok/s, TTFT 94 s** (+43 %) |
+| 32K prompt (25,602 new tokens, 8K prefix cached) | 56.2 tok/s, TTFT 456 s | **75.8 tok/s, TTFT 338 s** (+35 %) |
+| short prompt TTFT | 2.46 s | 1.73 s |
+| decode after 8K / 32K (64 tokens) | 7.56 / 11.64 tok/s | 7.62 / 11.45 tok/s |
+| GPU memory free after load | 2.4 / 2.0 / 2.0 GiB | same |
+| needle | found / found | found / found |
+
+Greedy tokens first differ at token 59 / 43 / 23 (short / 8K / 32K), chosen-token log-probability within 0.19 / 0.47 /
+0.62. That is the size of an ordinary precision change (q8 vs f16 KV: token 10, 0.77) and larger than run-to-run noise
+(token 83, 0.05): prefill activations are now quantized to Q8_1 for the expert products, as the decode path (and
+llama.cpp's CUDA MMQ prefill) already does.
+
 ## Changes and their measured effect
 
 | change | effect | kept |

@@ -1,0 +1,469 @@
+Grouped MoE expert mat-vec for SYCL prefill (on top of llama.cpp-moe-hot-cold-experts.patch and
+llama.cpp-moe-dynamic-residency.patch; same base). Measurements: docs/INTEL_ONLY_MOE.md, "Prefill: grouped MUL_MAT_ID".
+
+- MUL_MAT_ID with many tokens: the routed rows, already sorted by expert, are quantized to Q8_1 once and cut into
+  tiles of at most 8 rows of one expert; one kernel launch covers every tile of every expert. A subgroup reads one
+  weight row once per tile and applies it to all of the tile's rows. This replaces "dequantize the whole expert to f16,
+  then GEMM" per expert, which costs ~190 us per expert at these shapes however few rows the expert receives.
+- IQ2_XXS / IQ2_S / IQ3_XXS: decode-once kernel - a lane decodes its 32 codebook weights once into signed int8x4
+  words, then 8 dp4a per row (the generic vec_dot re-decodes per token; IQ2_XXS's is scalar).
+- Hybrid per expert: experts with <= 48 rows (decode-once types; 14 / 8 rows for the generic kernel) use the grouped
+  launch, larger ones keep the GEMM path. Decode (one token) is unchanged.
+- GGML_SYCL_MMID_GROUPED=0 (off) / 1 (generic grouped) / 2 (default: + decode-once), GGML_SYCL_MMID_GROUPED_MAX_ROWS=N.
+- test-backend-ops: perf cases at the GLM-5.3-Flash / DeepSeek V4 Flash expert shapes (4096 x 2048, 288 x top-8,
+  256 x top-6).
+
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index dc6cdd3..a7be507 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -411,6 +411,7 @@ struct ggml_backend_sycl_context {
+     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
+ 
+     std::vector<mmid_row_mapping> mmid_row_mapping_host;
++    std::vector<int32_t> mmid_tiles_host;   // grouped MUL_MAT_ID tiles, kept alive until the copy drains
+ 
+     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
+ 
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 686a4c7..5dd82c4 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -104,6 +104,8 @@ int g_ggml_sycl_enable_vmm = 1;
+ int g_ggml_sycl_enable_fusion = 1;
+ int g_ggml_sycl_enable_esimd = 1;
+ int g_ggml_sycl_prioritize_dmmv = 0;
++int g_ggml_sycl_mmid_grouped = 2;   // GGML_SYCL_MMID_GROUPED: 0 off, 1 grouped mat-vec, 2 + decode-once IQ kernel
++int g_ggml_sycl_mmid_grouped_max_rows = 0;   // GGML_SYCL_MMID_GROUPED_MAX_ROWS: 0 = per-type default
+ int g_ggml_sycl_use_async_mem_op = 0;
+ int g_ggml_sycl_use_async_mem_op_requested = 1;
+ int g_ggml_sycl_use_level_zero_api = 0;
+@@ -358,6 +360,8 @@ static void ggml_check_sycl() try {
+         g_ggml_sycl_enable_fusion = ggml_sycl_get_env("GGML_SYCL_ENABLE_FUSION", 1);
+         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
+         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
++        g_ggml_sycl_mmid_grouped = ggml_sycl_get_env("GGML_SYCL_MMID_GROUPED", 2);
++        g_ggml_sycl_mmid_grouped_max_rows = ggml_sycl_get_env("GGML_SYCL_MMID_GROUPED_MAX_ROWS", 0);
+ 
+ #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
+         g_ggml_sycl_use_level_zero_api = ggml_sycl_get_env("GGML_SYCL_USE_LEVEL_ZERO_API", 1);
+@@ -477,6 +481,7 @@ static void ggml_check_sycl() try {
+ #endif
+ 
+         GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
++        GGML_LOG_INFO("  GGML_SYCL_MMID_GROUPED: %d\n", g_ggml_sycl_mmid_grouped);
+ 
+         g_ggml_sycl_use_async_mem_op_requested = ggml_sycl_get_env("GGML_SYCL_USE_ASYNC_MEM_OP", 1);
+         GGML_LOG_INFO("  GGML_SYCL_USE_ASYNC_MEM_OP: %d\n", g_ggml_sycl_use_async_mem_op_requested);
+@@ -5219,10 +5224,63 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+             });
+         }
+ 
++        const ggml_tensor_extra_gpu * src0_extra_g = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++        const bool grouped = g_ggml_sycl_mmid_grouped && ggml_sycl_mul_mat_vec_q_id_grouped_supported(src0->type) &&
++                             !(src0_extra_g && src0_extra_g->optimized_feature.reorder) &&
++                             ne10 == ne00 && ne10 % QK8_1 == 0 && src1->type == GGML_TYPE_F32 &&
++                             dst->type == GGML_TYPE_F32;
++        // experts with at most max_rows routed rows go to the grouped kernel (one launch), larger ones keep the
++        // dequantize + GEMM path. Crossover measured on Arc Pro B70 (test-backend-ops perf, 4096x2048 experts):
++        // the GEMM path costs ~190 us per expert + ~2 us per row, the grouped kernel ~14 us per row for IQ2 types
++        // and ~22 us per row for IQ3_XXS.
++        // With GGML_SYCL_MMID_GROUPED=2 the IQ2_XXS / IQ2_S / IQ3_XXS experts use the decode-once kernel, ~5.4 us
++        // per row on the same shapes, which crosses the GEMM path near 56 rows; 48 keeps the hot experts on GEMM.
++        const bool    iq_dec   = g_ggml_sycl_mmid_grouped >= 2 && (src0->type == GGML_TYPE_IQ2_XXS ||
++                                 src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ3_XXS);
++        const int64_t max_rows = g_ggml_sycl_mmid_grouped_max_rows > 0 ? g_ggml_sycl_mmid_grouped_max_rows :
++                                 iq_dec ? 48 :
++                                 (src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS ||
++                                  src0->type == GGML_TYPE_IQ2_S) ? 14 : 8;
++        auto in_grouped = [&](int64_t i02) { return grouped && expert_row_counts[i02] <= max_rows; };
++        if (grouped) {
++            // one Q8_1 copy of the sorted rows, then one launch over every small expert's tiles
++            const int    padded = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
++            const size_t q8_row = (size_t) padded * sizeof(block_q8_1) / QK8_1;
++            ggml_sycl_pool_alloc<char> src1_q8(ctx.pool(), q8_row * n_routed_rows);
++            quantize_row_q8_1_sycl<quantize_q8_1>((const float *) src1_contiguous.get(), src1_q8.get(), (int) ne10,
++                                                  (int) n_routed_rows, padded, stream);
++            std::vector<int32_t> & tiles = ctx.mmid_tiles_host;   // drained by the stream->wait() of the next call
++            tiles.clear();
++            for (int64_t i02 = 0; i02 < n_as; i02++) {
++                if (!in_grouped(i02)) {
++                    continue;
++                }
++                for (int64_t off = 0; off < expert_row_counts[i02]; off += MMID_GROUPED_TILE) {
++                    tiles.push_back((int32_t) i02);
++                    tiles.push_back((int32_t) (expert_row_offsets[i02] + off));
++                    tiles.push_back((int32_t) std::min<int64_t>(MMID_GROUPED_TILE, expert_row_counts[i02] - off));
++                }
++            }
++            const int n_tiles = (int) (tiles.size() / 3);
++            if (n_tiles > 0) {
++            ggml_sycl_pool_alloc<int32_t> tiles_dev(ctx.pool(), tiles.size());
++            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tiles_dev.get(), tiles.data(), tiles.size() * sizeof(int32_t))));
++            const bool done_iq = g_ggml_sycl_mmid_grouped >= 2 &&
++                ggml_sycl_mul_mat_vec_q_id_grouped_iq(src0->type, src0->data, src1_q8.get(), (float *) dst_contiguous.get(),
++                                                      tiles_dev.get(), n_tiles, (int) ne10, (int) ne01, nb02, q8_row,
++                                                      (int) ne0, stream);
++            if (!done_iq) {
++                GGML_ASSERT(ggml_sycl_mul_mat_vec_q_id_grouped(src0->type, src0->data, src1_q8.get(),
++                                                               (float *) dst_contiguous.get(), tiles_dev.get(), n_tiles,
++                                                               (int) ne10, (int) ne01, nb02, q8_row, (int) ne0, stream));
++            }
++            }
++        }
++
+         for (int64_t i02 = 0; i02 < n_as; i02++) {
+             const int64_t num_src1_rows = expert_row_counts[i02];
+ 
+-            if (num_src1_rows == 0) {
++            if (num_src1_rows == 0 || in_grouped(i02)) {
+                 continue;
+             }
+ 
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index 3290343..83dc21f 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -3104,3 +3104,289 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
+             return false;
+     }
+ }
++
++// Grouped MoE mat-vec for prefill batches (MUL_MAT_ID with many tokens).
++//
++// The routed rows are sorted by expert and cut into tiles of at most MMID_GROUPED_TILE rows of one expert.
++// One launch covers every tile of every expert: a subgroup takes one weight row of the tile's expert and
++// computes its dot products with all of the tile's (Q8_1) activation rows, so each quantized weight block is
++// read once per tile and reused from registers instead of once per token. This replaces the per-expert
++// "dequantize the whole expert to f16, then GEMM" path, whose cost is dominated by materializing ~16 MiB of
++// f16 per expert per op when each expert only receives a few dozen rows.
++// tiles: int32 triplets {expert id, first routed row, rows in tile}.
++template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
++static void mul_mat_vec_q_moe_grouped(
++    const void * __restrict__ vx_base, const char * __restrict__ vy_sorted,
++    float * __restrict__ dst_sorted, const int32_t * __restrict__ tiles,
++    const int ncols, const int nrows, const size_t expert_weight_stride,
++    const size_t q8_row_stride, const int dst_row_stride,
++    const sycl::nd_item<3> & item_ct1) {
++    constexpr int T = MMID_GROUPED_TILE;
++    const int tile = item_ct1.get_group(1);
++    const int row  = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
++    if (row >= nrows) {
++        return;
++    }
++    const int e  = tiles[3 * tile + 0];
++    const int r0 = tiles[3 * tile + 1];
++    const int nt = tiles[3 * tile + 2];
++
++    const block_q_t * x = (const block_q_t *) ((const char *) vx_base + (size_t) e * expert_weight_stride);
++    const char *      y0 = vy_sorted + (size_t) r0 * q8_row_stride;
++
++    const int     blocks_per_row  = ncols / qk;
++    constexpr int blocks_per_warp = (vdr * WARP_SIZE + qi - 1) / qi;
++
++    float tmp[T];
++#pragma unroll
++    for (int t = 0; t < T; t++) {
++        tmp[t] = 0.0f;
++    }
++
++    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
++        const int ibx = row * blocks_per_row + i;
++        const int iby = i * (qk / QK8_1);
++        for (size_t elem = 0; elem < qi / vdr; elem += WARP_SIZE) {
++            const int iqs = elem + vdr * (item_ct1.get_local_id(2) % (qi / vdr));
++#pragma unroll
++            for (int t = 0; t < T; t++) {
++                if (t < nt) {
++                    const block_q8_1 * y = (const block_q8_1 *) (y0 + (size_t) t * q8_row_stride);
++                    tmp[t] += vec_dot_q_sycl(&x[ibx], &y[iby], iqs);
++                }
++            }
++        }
++    }
++
++#pragma unroll
++    for (int t = 0; t < T; t++) {
++#pragma unroll
++        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
++            tmp[t] += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp[t], mask);
++        }
++    }
++
++    if (item_ct1.get_local_id(2) == 0) {
++#pragma unroll
++        for (int t = 0; t < T; t++) {
++            if (t < nt) {
++                dst_sorted[(size_t) (r0 + t) * dst_row_stride + row] = tmp[t];
++            }
++        }
++    }
++}
++
++template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
++static void launch_mul_mat_vec_q_moe_grouped(
++    const void * vx_base, const char * vy_sorted, float * dst_sorted, const int32_t * tiles, int n_tiles,
++    int ncols, int nrows, size_t expert_weight_stride, size_t q8_row_stride, int dst_row_stride,
++    dpct::queue_ptr stream) {
++    constexpr int        rows_per_wg = 4;
++    const int            block_num_y = (nrows + rows_per_wg - 1) / rows_per_wg;
++    const sycl::range<3> block_nums(1, (unsigned) n_tiles, (unsigned) block_num_y);
++    const sycl::range<3> block_dims(1, rows_per_wg, WARP_SIZE);
++    stream->submit([&](sycl::handler & cgh) {
++        cgh.parallel_for(
++            sycl::nd_range<3>(block_nums * block_dims, block_dims),
++            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                mul_mat_vec_q_moe_grouped<qk, qi, block_q_t, vdr, vec_dot_q_sycl>(
++                    vx_base, vy_sorted, dst_sorted, tiles, ncols, nrows,
++                    expert_weight_stride, q8_row_stride, dst_row_stride, item);
++            });
++    });
++}
++
++bool ggml_sycl_mul_mat_vec_q_id_grouped_supported(enum ggml_type t) {
++    switch (t) {
++        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
++        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
++        case GGML_TYPE_IQ1_S:   case GGML_TYPE_IQ1_M:
++        case GGML_TYPE_IQ4_NL:  case GGML_TYPE_IQ4_XS:
++        case GGML_TYPE_MXFP4:
++        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
++        case GGML_TYPE_Q4_0: case GGML_TYPE_Q8_0:
++            return true;
++        default:
++            return false;
++    }
++}
++
++#define MMID_G(QK, QI, BLOCK, VDR, DOT) \
++    launch_mul_mat_vec_q_moe_grouped<QK, QI, BLOCK, VDR, DOT>(vx_base, vy_sorted, dst_sorted, tiles, n_tiles, ncols, \
++        nrows, expert_weight_stride, q8_row_stride, dst_row_stride, stream); return true
++
++bool ggml_sycl_mul_mat_vec_q_id_grouped(
++    enum ggml_type src0_type, const void * vx_base, const char * vy_sorted, float * dst_sorted,
++    const int32_t * tiles, int n_tiles, int ncols, int nrows, size_t expert_weight_stride,
++    size_t q8_row_stride, int dst_row_stride, dpct::queue_ptr stream) {
++    switch (src0_type) {
++        case GGML_TYPE_IQ2_XXS: MMID_G(QK_K, QI2_XXS/2, block_iq2_xxs, VDR_IQ2_XXS_Q8_1_MMVQ, vec_dot_iq2_xxs_q8_1_moe);
++        case GGML_TYPE_IQ2_XS:  MMID_G(QK_K, QI2_XS/2, block_iq2_xs, VDR_IQ2_XS_Q8_1_MMVQ, vec_dot_iq2_xs_q8_1_moe);
++        case GGML_TYPE_IQ2_S:   MMID_G(QK_K, QI2_S/2, block_iq2_s, VDR_IQ2_S_Q8_1_MMVQ, vec_dot_iq2_s_q8_1);
++        case GGML_TYPE_IQ3_XXS: MMID_G(QK_K, QI3_XXS/2, block_iq3_xxs, VDR_IQ3_XXS_Q8_1_MMVQ, vec_dot_iq3_xxs_q8_1_moe);
++        case GGML_TYPE_IQ3_S:   MMID_G(QK_K, QI3_S/2, block_iq3_s, VDR_IQ3_S_Q8_1_MMVQ, vec_dot_iq3_s_q8_1_moe);
++        case GGML_TYPE_IQ1_S:   MMID_G(QK_K, QI1_S, block_iq1_s, VDR_IQ1_S_Q8_1_MMVQ, vec_dot_iq1_s_q8_1_moe);
++        case GGML_TYPE_IQ1_M:   MMID_G(QK_K, QI1_S, block_iq1_m, VDR_IQ1_M_Q8_1_MMVQ, vec_dot_iq1_m_q8_1);
++        case GGML_TYPE_IQ4_NL:  MMID_G(QK4_NL, QI4_NL, block_iq4_nl, VDR_IQ4_NL_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1);
++        case GGML_TYPE_IQ4_XS:  MMID_G(QK_K, QI4_XS/4, block_iq4_xs, VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_iq4_xs_q8_1);
++        case GGML_TYPE_MXFP4:   MMID_G(QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1);
++        case GGML_TYPE_Q2_K:    MMID_G(QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1);
++        case GGML_TYPE_Q3_K:    MMID_G(QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1);
++        case GGML_TYPE_Q4_K:    MMID_G(QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1);
++        case GGML_TYPE_Q5_K:    MMID_G(QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1);
++        case GGML_TYPE_Q6_K:    MMID_G(QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1);
++        case GGML_TYPE_Q4_0:    MMID_G(QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1);
++        case GGML_TYPE_Q8_0:    MMID_G(QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1);
++        default: return false;
++    }
++}
++#undef MMID_G
++
++// Decode-once variant of the grouped MoE kernel for the IQ codebook types. The generic vec_dot re-decodes the
++// codebook for every token; here a lane decodes its 32 weights once into eight signed int8x4 words (plus the
++// scale of each 16-weight half) and then does 8 dp4a per routed row of the tile.
++struct iq_dec32 {
++    int   w[8];
++    float s_lo, s_hi;   // scales of w[0..3] and w[4..7] (block d included; the activation's d is applied per row)
++};
++
++static __dpct_inline__ void iq_dec_iq2_xxs(const void * vbq, int ib32, iq_dec32 & o) {
++    const block_iq2_xxs * b = (const block_iq2_xxs *) vbq;
++    const uint16_t * q2 = b->qs + 4*ib32;
++    const uint8_t  * aux8 = (const uint8_t *) q2;
++    uint32_t aux32 = q2[2] | (q2[3] << 16);
++#pragma unroll
++    for (int l = 0; l < 4; ++l) {
++        const uint32_t * grid  = (const uint32_t *) (iq2xxs_grid + aux8[l]);
++        const uint32_t * signs = (const uint32_t *) (ksigns64 + (aux32 & 127));
++        o.w[2*l+0] = dpct::vectorized_binary<sycl::uchar4>(grid[0] ^ signs[0], signs[0], std::minus<>());
++        o.w[2*l+1] = dpct::vectorized_binary<sycl::uchar4>(grid[1] ^ signs[1], signs[1], std::minus<>());
++        aux32 >>= 7;
++    }
++    o.s_lo = o.s_hi = (float) b->d * (0.5f + aux32) * 0.25f;
++}
++
++static __dpct_inline__ void iq_dec_iq3_xxs(const void * vbq, int ib32, iq_dec32 & o) {
++    const block_iq3_xxs * b = (const block_iq3_xxs *) vbq;
++    const uint8_t  * q3  = b->qs + 8*ib32;
++    const uint16_t * gas = (const uint16_t *) (b->qs + QK_K/4) + 2*ib32;
++    uint32_t aux32 = gas[0] | (gas[1] << 16);
++#pragma unroll
++    for (int l = 0; l < 4; ++l) {
++        const uint32_t * signs = (const uint32_t *) (ksigns64 + (aux32 & 127));
++        o.w[2*l+0] = dpct::vectorized_binary<sycl::uchar4>(iq3xxs_grid[q3[2*l+0]] ^ signs[0], signs[0], std::minus<>());
++        o.w[2*l+1] = dpct::vectorized_binary<sycl::uchar4>(iq3xxs_grid[q3[2*l+1]] ^ signs[1], signs[1], std::minus<>());
++        aux32 >>= 7;
++    }
++    o.s_lo = o.s_hi = (float) b->d * (0.5f + aux32) * 0.5f;
++}
++
++static __dpct_inline__ void iq_dec_iq2_s(const void * vbq, int ib32, iq_dec32 & o) {
++    const block_iq2_s * b = (const block_iq2_s *) vbq;
++    const uint8_t * signs = b->qs + QK_K/8 + 4*ib32;
++#pragma unroll
++    for (int l = 0; l < 4; ++l) {
++        const uint32_t * grid = (const uint32_t *) (iq2s_grid + (b->qs[4*ib32+l] | ((b->qh[ib32] << (8-2*l)) & 0x300)));
++        const uint32_t s0 = dpct::vectorized_binary<sycl::uchar4>(((signs[l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201, std::equal_to<>());
++        const uint32_t s1 = dpct::vectorized_binary<sycl::uchar4>(((signs[l] >> 4)  * 0x01010101) & 0x08040201, 0x08040201, std::equal_to<>());
++        o.w[2*l+0] = dpct::vectorized_binary<sycl::uchar4>(grid[0] ^ s0, s0, std::minus<>());
++        o.w[2*l+1] = dpct::vectorized_binary<sycl::uchar4>(grid[1] ^ s1, s1, std::minus<>());
++    }
++    const float d = (float) b->d * 0.25f;
++    o.s_lo = d * (0.5f + (b->scales[ib32] & 0xf));
++    o.s_hi = d * (0.5f + (b->scales[ib32] >> 4));
++}
++
++template <typename block_q_t, void (*decode)(const void *, int, iq_dec32 &)>
++static void mul_mat_vec_q_moe_grouped_iq(
++    const void * __restrict__ vx_base, const char * __restrict__ vy_sorted,
++    float * __restrict__ dst_sorted, const int32_t * __restrict__ tiles,
++    const int ncols, const int nrows, const size_t expert_weight_stride,
++    const size_t q8_row_stride, const int dst_row_stride,
++    const sycl::nd_item<3> & item_ct1) {
++    constexpr int T = MMID_GROUPED_TILE;
++    constexpr int lanes_per_block = QK_K / 32;               // one lane per 32 weights of a 256-weight block
++    constexpr int blocks_per_warp = WARP_SIZE / lanes_per_block;
++    const int tile = item_ct1.get_group(1);
++    const int row  = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
++    if (row >= nrows) {
++        return;
++    }
++    const int e = tiles[3*tile + 0], r0 = tiles[3*tile + 1], nt = tiles[3*tile + 2];
++    const block_q_t * x  = (const block_q_t *) ((const char *) vx_base + (size_t) e * expert_weight_stride);
++    const char *      y0 = vy_sorted + (size_t) r0 * q8_row_stride;
++    const int blocks_per_row = ncols / QK_K;
++    const int lane = item_ct1.get_local_id(2);
++    const int ib32 = lane % lanes_per_block;
++
++    float tmp[T];
++#pragma unroll
++    for (int t = 0; t < T; t++) tmp[t] = 0.0f;
++
++    for (int i = lane / lanes_per_block; i < blocks_per_row; i += blocks_per_warp) {
++        iq_dec32 dw;
++        decode(&x[row * blocks_per_row + i], ib32, dw);
++        const int iby = i * (QK_K / QK8_1) + ib32;
++#pragma unroll
++        for (int t = 0; t < T; t++) {
++            if (t < nt) {
++                const block_q8_1 & yb = ((const block_q8_1 *) (y0 + (size_t) t * q8_row_stride))[iby];
++                const int * q = (const int *) yb.qs;
++                int lo = 0, hi = 0;
++#pragma unroll
++                for (int k = 0; k < 4; k++) lo = dpct::dp4a(dw.w[k], q[k], lo);
++#pragma unroll
++                for (int k = 4; k < 8; k++) hi = dpct::dp4a(dw.w[k], q[k], hi);
++                tmp[t] += (float) yb.ds[0] * (dw.s_lo * lo + dw.s_hi * hi);
++            }
++        }
++    }
++
++#pragma unroll
++    for (int t = 0; t < T; t++) {
++#pragma unroll
++        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
++            tmp[t] += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp[t], mask);
++        }
++    }
++    if (lane == 0) {
++#pragma unroll
++        for (int t = 0; t < T; t++) {
++            if (t < nt) dst_sorted[(size_t) (r0 + t) * dst_row_stride + row] = tmp[t];
++        }
++    }
++}
++
++template <typename block_q_t, void (*decode)(const void *, int, iq_dec32 &)>
++static void launch_mul_mat_vec_q_moe_grouped_iq(
++    const void * vx_base, const char * vy_sorted, float * dst_sorted, const int32_t * tiles, int n_tiles,
++    int ncols, int nrows, size_t expert_weight_stride, size_t q8_row_stride, int dst_row_stride,
++    dpct::queue_ptr stream) {
++    constexpr int        rows_per_wg = 4;
++    const sycl::range<3> block_nums(1, (unsigned) n_tiles, (unsigned) ((nrows + rows_per_wg - 1) / rows_per_wg));
++    const sycl::range<3> block_dims(1, rows_per_wg, WARP_SIZE);
++    stream->submit([&](sycl::handler & cgh) {
++        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                mul_mat_vec_q_moe_grouped_iq<block_q_t, decode>(vx_base, vy_sorted, dst_sorted, tiles, ncols, nrows,
++                    expert_weight_stride, q8_row_stride, dst_row_stride, item);
++            });
++    });
++}
++
++// Returns false for types without a decode-once kernel (the caller then uses the generic grouped kernel).
++bool ggml_sycl_mul_mat_vec_q_id_grouped_iq(
++    enum ggml_type src0_type, const void * vx_base, const char * vy_sorted, float * dst_sorted,
++    const int32_t * tiles, int n_tiles, int ncols, int nrows, size_t expert_weight_stride,
++    size_t q8_row_stride, int dst_row_stride, dpct::queue_ptr stream) {
++    if (WARP_SIZE % (QK_K / 32) != 0) return false;
++#define MMID_GIQ(BLOCK, DEC) launch_mul_mat_vec_q_moe_grouped_iq<BLOCK, DEC>(vx_base, vy_sorted, dst_sorted, tiles, \
++        n_tiles, ncols, nrows, expert_weight_stride, q8_row_stride, dst_row_stride, stream); return true
++    switch (src0_type) {
++        case GGML_TYPE_IQ2_XXS: MMID_GIQ(block_iq2_xxs, iq_dec_iq2_xxs);
++        case GGML_TYPE_IQ3_XXS: MMID_GIQ(block_iq3_xxs, iq_dec_iq3_xxs);
++        case GGML_TYPE_IQ2_S:   MMID_GIQ(block_iq2_s,   iq_dec_iq2_s);
++        default: return false;
++    }
++#undef MMID_GIQ
++}
+diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
+index 9d2f564..0bd5c9b 100644
+--- a/ggml/src/ggml-sycl/mmvq.hpp
++++ b/ggml/src/ggml-sycl/mmvq.hpp
+@@ -73,4 +73,28 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(
+     int                stride_col_dst,       // floats between output columns in dst
+     dpct::queue_ptr    stream);
+ 
++// Grouped MoE mat-vec for prefill (MUL_MAT_ID with many tokens): routed rows sorted by expert, cut into tiles of
++// at most MMID_GROUPED_TILE rows of one expert; one launch for all tiles. Standard (non-reorder) src0 layout.
++#define MMID_GROUPED_TILE 8
++bool ggml_sycl_mul_mat_vec_q_id_grouped_supported(enum ggml_type src0_type);
++bool ggml_sycl_mul_mat_vec_q_id_grouped(
++    enum ggml_type     src0_type,
++    const void *       vx_base,              // stacked expert weights
++    const char *       vy_sorted,            // Q8_1 activation rows, sorted by expert
++    float *            dst_sorted,           // output rows in the same sorted order
++    const int32_t *    tiles,                // device int32 triplets {expert, first row, rows (<= tile)}
++    int                n_tiles,
++    int                ncols,
++    int                nrows,
++    size_t             expert_weight_stride, // bytes between experts
++    size_t             q8_row_stride,        // bytes between Q8_1 activation rows
++    int                dst_row_stride,       // floats between output rows
++    dpct::queue_ptr    stream);
++
++// Decode-once IQ variant (IQ2_XXS, IQ2_S, IQ3_XXS); false = type not handled. Same arguments.
++bool ggml_sycl_mul_mat_vec_q_id_grouped_iq(
++    enum ggml_type src0_type, const void * vx_base, const char * vy_sorted, float * dst_sorted,
++    const int32_t * tiles, int n_tiles, int ncols, int nrows, size_t expert_weight_stride,
++    size_t q8_row_stride, int dst_row_stride, dpct::queue_ptr stream);
++
+ #endif // GGML_SYCL_MMVQ_HPP
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1616004..a65ec59 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11138,6 +11138,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // GLM-5.3-Flash Maya-S (IQ2_XXS gate/up, IQ3_XXS down) and DeepSeek V4 Flash (IQ2_S gate/up): 4096 x 2048
++    // experts, top-8 of 288 / top-6 of 256. Gate/up broadcast one activation row per token, down takes one per slot.
++    for (int bs : {1, 32, 256, 1024}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 288, 8, true,  2048, bs, 4096));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 288, 8, false, 4096, bs, 2048));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_S,   GGML_TYPE_F32, 256, 6, true,  2048, bs, 4096));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 256, 6, false, 4096, bs, 2048));
++    }
++
+     // qwen3-30b-a3b
+     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
