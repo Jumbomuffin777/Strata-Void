@@ -11,7 +11,7 @@ it can be repeated on another.
 |---|---|
 | GPUs | Arc Pro B70 32 GB, B65 32 GB (PCIe 5.0 x8 each, CPU lanes), B60 24 GB (PCIe 4.0 x4 behind the chipset) |
 | host -> GPU (pinned) | B70 / B65 28.7 GB/s, B60 7.0 GB/s; one 9 MiB expert: 0.35 ms (B65), 1.4 ms (B60), 2.3 ms (B70: small-copy latency) |
-| GPU clocks | B70 up to 2800 MHz, B65 / B60 2400 MHz; all three in the driver's `power_saving` profile |
+| GPU clocks | B70 up to 2800 MHz, B65 / B60 2400 MHz; all three in the driver's `base` power profile (sysfs shows `[base] power_saving`: the bracketed entry is the active one) |
 | CPU / RAM | 16 cores, 64 GB DDR5 (60 GB usable, ~33 GB free beside the other services) |
 
 For one decoded token the CPU reads a cold expert from DDR5 faster than it could be sent to a GPU, so cold experts are
