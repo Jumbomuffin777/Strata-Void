@@ -25,6 +25,19 @@ The benchmarks use **Swift 1.5** by **UkisAI**
 Swift Open License 1.0), a fine-tune of **Qwen3.8-Flash-Next** by the **Qwen team**, whose base checkpoint supplies
 the MTP draft head. No weights are redistributed here.
 
+The Intel-only MoE work (`docs/INTEL_ONLY_MOE.md`) uses:
+
+- **GLM-5.3-Flash** by **Z.ai** ([zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash), MIT),
+  run as **Project Maya**'s quant **Maya-S** (`Maya-S-v2-IQ2_XXS`), published by **peasantsmith**
+  ([peasantsmith/GLM-5.3-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF), MIT).
+  **[Project Maya](https://github.com/mw00/project-maya)** by **mw00** (MIT, also a Strata fork) made GLM-5.3-Flash run
+  on the Strata base: its native GLM implementation, its expert-cache design and its calibrated quants are the
+  reference this work builds on, and the hot/cold patch reads its `glm5-next` architecture name and metadata keys.
+  Thank you.
+- **DeepSeek V4 Flash** by **DeepSeek**, as **Unsloth**'s GGUF quant (`UD-IQ3_XXS`).
+
+No weights are redistributed here.
+
 ## Tools
 
 Intel oneAPI DPC++ / oneMKL and the Level Zero runtime; llama.cpp's `gguf-py` (used by upstream's model tools);

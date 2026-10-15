@@ -29,6 +29,23 @@ Strata Void's version numbers are its own, independent of upstream's engine vers
 - Tools: `tools/llamacpp/op-profile.cpp` (per-op and per-segment timing, prefill and decode), `bench_hotcold.py` (repeatable TTFT / prefill / decode at fixed prompt sizes), `compare_logprobs.py` (greedy log-probability comparison of two runs); tests `test_moe_residency.cpp` (policy, in CI), `test_mmid_skip.cpp` (CPU id -1, 6 types), `test_dsa_gather.cpp` (gathered vs dense attention against an f64 reference, exact kept set). `build_hotcold.sh` no longer stops silently when oneAPI's `setvars.sh` is sourced under `set -u`.
 - `tools/moe_placement` reads `glm5-next` files (Project Maya) as `glm5next`.
 
+**Faster prompt reading on Intel (grouped MoE prefill) and gathered DeepSeek V4 decode: third and fourth patches**
+
+- `patches/llama.cpp-sycl-grouped-moe.patch`: MUL_MAT_ID with many tokens no longer dequantizes every expert to f16
+  for a GEMM. Routed rows are quantized to Q8_1 once and one launch covers tiles of up to 8 rows per expert; IQ2_XXS,
+  IQ2_S and IQ3_XXS decode each codebook group once and reuse it with dp4a; experts with more than 48 rows keep the GEMM
+  path; decode is unchanged. Maya-S prefill 8K 60.6 -> 86.8 tok/s, 32K 56.2 -> 75.8 tok/s, perplexity unchanged
+  (1.8938 -> 1.8927); DeepSeek V4 Flash prefill 8K 62.8 -> 79.9, 32K 47.0 -> 55.5, 64K 32.1 -> 36.0 tok/s.
+  `test-backend-ops` MUL_MAT_ID 913/913 on B70 and B60. `GGML_SYCL_MMID_GROUPED=0` restores the old path.
+- `patches/llama.cpp-dsv4-gather.patch` (opt-in, `LLAMA_DSV4_GATHER=1`): DeepSeek V4's CSA layers attend over only
+  the cells their mask keeps (the `n_kv_max` bound that ggml-sycl's flash attention ignores), from 4,096 cells.
+  Decode 32K 7.48 -> 8.83 tok/s, 64K 6.32 -> 7.71 tok/s; 128 greedy tokens identical to the dense path at short, 8K,
+  32K and 64K. `test_dsa_gather` takes the selection size and cell counts as arguments and passes at DeepSeek's sizes.
+- An out-of-range MoE expert id now reports the ids tensor, token, slot and row before aborting (an intermittent,
+  pre-existing abort in long prefills is still open; see `docs/INTEL_ONLY_CONTINUATION.md`).
+- Measured and documented in `docs/INTEL_ONLY_MOE.md`: a higher GPU minimum clock changes decode by < 0.2 % (the
+  cards hold their top clocks through layer-split gaps); the GPUs were already in the driver's `base` power profile.
+
 ## void-v0.1.1 (2026-10-11)
 
 **Server protocol fixes, not a new SYCL kernel optimization**
